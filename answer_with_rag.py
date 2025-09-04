@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
 import re
 import os
@@ -22,23 +22,28 @@ except Exception:
 
 # Use GPT-5 for chat/answers
 COMPLETIONS_MODEL = "gpt-5"
-MAX_CONTEXT_CHARS = 8000
 
 # ─────────────────────────────────────────────────────────────
-# Context Builder
+# Context Builder (fast-mode aware)
 # ─────────────────────────────────────────────────────────────
-def build_context(topk: List[Tuple[int, float, Dict]]) -> str:
+def build_context(
+    topk: List[Tuple[int, float, Dict]],
+    total_max_chars: int,
+    per_snippet_max: int,
+) -> str:
     """
-    Create a compact context: [SOURCE: filename | CHUNK: id]
-    Then snippet text, respecting MAX_CONTEXT_CHARS.
+    Compact context with per-snippet and total caps.
+    Format: [SOURCE: filename | CHUNK: id]\n<snippet>\n
     """
     parts, total = [], 0
     for _, _, meta in topk:
         fname = meta.get("filename", "unknown.txt")
         cid = meta.get("chunk_id", 0)
-        text = meta.get("text_preview", "")
-        snippet = f"[SOURCE: {fname} | CHUNK: {cid}]\n{text}\n"
-        if total + len(snippet) > MAX_CONTEXT_CHARS:
+        text = meta.get("text_preview", "") or ""
+        # Keep the most informative start of the chunk only
+        snippet_body = text[:per_snippet_max]
+        snippet = f"[SOURCE: {fname} | CHUNK: {cid}]\n{snippet_body}\n"
+        if total + len(snippet) > total_max_chars:
             break
         parts.append(snippet)
         total += len(snippet)
@@ -147,7 +152,7 @@ def resolve_date_window_from_query(q: str):
     return None
 
 # ─────────────────────────────────────────────────────────────
-# Generative intent bypass (act like regular GPT)
+# Generative intent bypass (act like regular GPT for brainstorming)
 # ─────────────────────────────────────────────────────────────
 _GEN_PAT = re.compile(
     r"\b(idea|ideas|brainstorm|suggest|suggestions|plan|plans|strategy|strategies|framework|outline|"
@@ -166,6 +171,7 @@ def ask_gpt(
     context: str = "",
     chat_history: List[Dict] = [],
     structure: str = "none",
+    max_tokens: Optional[int] = None,
 ) -> str:
     system = (
         "You are a precise Virtual CEO assistant. "
@@ -183,8 +189,8 @@ def ask_gpt(
 
     messages: List[Dict] = [{"role": "system", "content": system}]
 
-    # Include up to last 4 chat history turns
-    for msg in chat_history[-4:]:
+    # Include up to last 2 chat history turns (faster)
+    for msg in chat_history[-2:]:
         content = msg.get("content", "")
         timestamp = msg.get("timestamp", "")
         role = msg.get("role", "user")
@@ -196,22 +202,22 @@ def ask_gpt(
     else:
         messages.append({"role": "user", "content": query})
 
-    # IMPORTANT: no temperature passed for GPT-5
+    # IMPORTANT: no temperature for GPT-5; do cap max_tokens for speed if provided
     if _use_client:
-        resp = _client.chat.completions.create(  # type: ignore
-            model=COMPLETIONS_MODEL,
-            messages=messages[-6:],
-        )
+        kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        resp = _client.chat.completions.create(**kwargs)  # type: ignore
         return resp.choices[0].message.content
     else:
-        resp = openai.ChatCompletion.create(  # type: ignore
-            model=COMPLETIONS_MODEL,
-            messages=messages[-6:],
-        )
+        kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        resp = openai.ChatCompletion.create(**kwargs)  # type: ignore
         return resp.choices[0].message["content"]
 
 # ─────────────────────────────────────────────────────────────
-# Public API (with strong fallbacks A & B)
+# Public API (with strong fallbacks A & B, fast-mode aware)
 # ─────────────────────────────────────────────────────────────
 def answer(
     query: str,
@@ -219,6 +225,7 @@ def answer(
     chat_history: List[Dict] = [],
     restrict_to_meetings: bool = False,
     use_rag: bool = True,
+    fast_mode: bool = True,
 ) -> str:
     """
     - Detects relative/specific dates and restricts retrieval to that window when found.
@@ -227,10 +234,19 @@ def answer(
     - Fallbacks:
         A) If restrict_to_meetings=True but we got no meeting hits, fall back to general search.
         B) If a date window is requested but returns no hits, fall back to general search (no window).
+    - Fast mode:
+        * Smaller RAG context
+        * Shorter output via max_tokens
+        * Fewer history turns
     """
+    # Fast-mode caps
+    total_cap = 3000 if fast_mode else 8000
+    per_snip = 600 if fast_mode else 1200
+    out_tokens = 500 if fast_mode else None  # cap model output for speed
+
     # Generative bypass or explicit GPT-only mode
     if not use_rag or is_generative(query):
-        return ask_gpt(query, context="", chat_history=chat_history, structure="none")
+        return ask_gpt(query, context="", chat_history=chat_history, structure="none", max_tokens=out_tokens)
 
     def _has_meeting_hits(hs):
         for _, _, meta in hs or []:
@@ -267,16 +283,16 @@ def answer(
 
     # If nothing usable, answer without sources
     if not hits:
-        return ask_gpt(query, context="", chat_history=chat_history, structure="none")
+        return ask_gpt(query, context="", chat_history=chat_history, structure="none", max_tokens=out_tokens)
 
     # Build context and choose structure
-    ctx = build_context(hits)
+    ctx = build_context(hits, total_max_chars=total_cap, per_snippet_max=per_snip)
     is_meeting_ctx = any((meta.get("folder", "").lower() == "meetings") for _, _, meta in hits)
     wants_summary = bool(re.search(r"\b(summary|summarize|decisions?|action items?)\b", query, re.I))
     structure = "meeting_summary" if (is_meeting_ctx and (restrict_to_meetings or wants_summary)) else "none"
 
-    return ask_gpt(query, context=ctx, chat_history=chat_history, structure=structure)
+    return ask_gpt(query, context=ctx, chat_history=chat_history, structure=structure, max_tokens=out_tokens)
 
 # Optional CLI test
 if __name__ == "__main__":
-    print(answer("Who is our AI Coordinator this week?", k=7, restrict_to_meetings=True))
+    print(answer("Who is our AI Coordinator this week?", k=4, restrict_to_meetings=True, fast_mode=True))
