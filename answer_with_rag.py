@@ -39,10 +39,8 @@ def build_context(
     for _, _, meta in topk:
         fname = meta.get("filename", "unknown.txt")
         cid = meta.get("chunk_id", 0)
-        text = meta.get("text_preview", "") or ""
-        # Keep the most informative start of the chunk only
-        snippet_body = text[:per_snippet_max]
-        snippet = f"[SOURCE: {fname} | CHUNK: {cid}]\n{snippet_body}\n"
+        text = (meta.get("text_preview", "") or "")[:per_snippet_max]
+        snippet = f"[SOURCE: {fname} | CHUNK: {cid}]\n{text}\n"
         if total + len(snippet) > total_max_chars:
             break
         parts.append(snippet)
@@ -123,7 +121,7 @@ def resolve_date_window_from_query(q: str):
         m = today.month
         qn = 1 if m <= 3 else 2 if m <= 6 else 3 if m <= 9 else 4
         start, end = _quarter_bounds(qn, today.year)
-        end = min(end, today.replace(hour=23, minute=59, second=59, microsecond=0))  # don't go into future
+        end = min(end, today.replace(hour=23, minute=59, second=59, microsecond=0))
         return (start, end)
 
     qm = _Q_PAT.search(s)
@@ -132,7 +130,7 @@ def resolve_date_window_from_query(q: str):
         year = int(qm.group(2))
         return _quarter_bounds(qn, year)
 
-    # specific ISO date
+    # ISO date
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         y, mo, d = map(int, m.groups())
@@ -140,7 +138,7 @@ def resolve_date_window_from_query(q: str):
         end = datetime(y, mo, d, 23, 59, 59)
         return (start, end)
 
-    # textual date like "September 2, 2025"
+    # "September 2, 2025"
     m2 = re.search(rf"{_MONTHS}\s+(\d{{1,2}}),\s*(\d{{4}})", s, re.I)
     if m2:
         month_name, dd, yy = m2.groups()
@@ -164,14 +162,14 @@ def is_generative(q: str) -> bool:
     return bool(_GEN_PAT.search(q))
 
 # ─────────────────────────────────────────────────────────────
-# Chat Completion (no temperature for GPT-5)
+# Chat Completion (GPT-5: use max_completion_tokens; no temperature)
 # ─────────────────────────────────────────────────────────────
 def ask_gpt(
     query: str,
     context: str = "",
     chat_history: List[Dict] = [],
     structure: str = "none",
-    max_tokens: Optional[int] = None,
+    max_completion_tokens: Optional[int] = None,
 ) -> str:
     system = (
         "You are a precise Virtual CEO assistant. "
@@ -179,7 +177,6 @@ def ask_gpt(
         "When no sources are provided, answer with your general knowledge clearly and concisely."
     )
 
-    # Optional structure for meeting summaries
     if structure == "meeting_summary":
         system += (
             "\nFormat the answer with these exact H2 sections in order: "
@@ -189,35 +186,29 @@ def ask_gpt(
 
     messages: List[Dict] = [{"role": "system", "content": system}]
 
-    # Include up to last 2 chat history turns (faster)
+    # Use only last 2 history turns (faster)
     for msg in chat_history[-2:]:
         content = msg.get("content", "")
         timestamp = msg.get("timestamp", "")
         role = msg.get("role", "user")
-        formatted = f"[{timestamp}] {content}" if timestamp else content
-        messages.append({"role": role, "content": formatted})
+        messages.append({"role": role, "content": f"[{timestamp}] {content}" if timestamp else content})
 
-    if context:
-        messages.append({"role": "user", "content": f"Query:\n{query}\n\nSources:\n{context}"})
-    else:
-        messages.append({"role": "user", "content": query})
+    messages.append({"role": "user", "content": f"Query:\n{query}\n\nSources:\n{context}"} if context else {"role": "user", "content": query})
 
-    # IMPORTANT: no temperature for GPT-5; do cap max_tokens for speed if provided
+    # IMPORTANT: GPT-5 expects max_completion_tokens (not max_tokens)
+    kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
+    if max_completion_tokens is not None:
+        kwargs["max_completion_tokens"] = max_completion_tokens
+
     if _use_client:
-        kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
         resp = _client.chat.completions.create(**kwargs)  # type: ignore
         return resp.choices[0].message.content
     else:
-        kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
         resp = openai.ChatCompletion.create(**kwargs)  # type: ignore
         return resp.choices[0].message["content"]
 
 # ─────────────────────────────────────────────────────────────
-# Public API (with strong fallbacks A & B, fast-mode aware)
+# Public API (fallbacks A & B, fast-mode aware)
 # ─────────────────────────────────────────────────────────────
 def answer(
     query: str,
@@ -228,25 +219,25 @@ def answer(
     fast_mode: bool = True,
 ) -> str:
     """
-    - Detects relative/specific dates and restricts retrieval to that window when found.
-    - Skips retrieval entirely for generative asks or when use_rag=False.
-    - Structures meeting digests when appropriate (Agenda / Decisions / Action Items).
+    - Date windows when found.
+    - Skip retrieval for generative asks or when use_rag=False.
+    - Structured meeting digests when appropriate.
     - Fallbacks:
-        A) If restrict_to_meetings=True but we got no meeting hits, fall back to general search.
-        B) If a date window is requested but returns no hits, fall back to general search (no window).
+        A) Meetings-only requested but no meeting hits → general search.
+        B) Date-window returns no hits → general search (no window).
     - Fast mode:
         * Smaller RAG context
-        * Shorter output via max_tokens
-        * Fewer history turns
+        * Shorter output via max_completion_tokens
+        * Less history
     """
     # Fast-mode caps
     total_cap = 3000 if fast_mode else 8000
     per_snip = 600 if fast_mode else 1200
-    out_tokens = 500 if fast_mode else None  # cap model output for speed
+    out_tokens = 500 if fast_mode else None
 
     # Generative bypass or explicit GPT-only mode
     if not use_rag or is_generative(query):
-        return ask_gpt(query, context="", chat_history=chat_history, structure="none", max_tokens=out_tokens)
+        return ask_gpt(query, context="", chat_history=chat_history, structure="none", max_completion_tokens=out_tokens)
 
     def _has_meeting_hits(hs):
         for _, _, meta in hs or []:
@@ -254,7 +245,7 @@ def answer(
                 return True
         return False
 
-    hits = []
+    hits: List[Tuple[int, float, Dict]] = []
 
     # 1) Date-scoped search if query contains a window
     win = resolve_date_window_from_query(query)
@@ -262,37 +253,36 @@ def answer(
         start, end = win
         hits = search_in_date_window(query, start, end, k=k)
 
-        # Fallback B: date window yielded nothing → try general search (no window)
+        # Fallback B: date window yielded nothing → general search
         if not hits:
             hits = search(query, k=k)
 
-        # Fallback A (in date path): forced meetings but no meeting hits → try general search
+        # Fallback A: forced meetings but not actually meeting hits → general search
         if restrict_to_meetings and not _has_meeting_hits(hits):
             alt = search(query, k=k)
             if alt:
                 hits = alt
     else:
-        # 2) No date window → prefer meetings only if user asked
+        # 2) No date window
         hits = search_meetings(query, k=k) if restrict_to_meetings else search(query, k=k)
 
-        # Fallback A (no date path): meetings requested but not actually meeting hits
+        # Fallback A
         if restrict_to_meetings and not _has_meeting_hits(hits):
             alt = search(query, k=k)
             if alt:
                 hits = alt
 
-    # If nothing usable, answer without sources
     if not hits:
-        return ask_gpt(query, context="", chat_history=chat_history, structure="none", max_tokens=out_tokens)
+        return ask_gpt(query, context="", chat_history=chat_history, structure="none", max_completion_tokens=out_tokens)
 
-    # Build context and choose structure
     ctx = build_context(hits, total_max_chars=total_cap, per_snippet_max=per_snip)
     is_meeting_ctx = any((meta.get("folder", "").lower() == "meetings") for _, _, meta in hits)
     wants_summary = bool(re.search(r"\b(summary|summarize|decisions?|action items?)\b", query, re.I))
     structure = "meeting_summary" if (is_meeting_ctx and (restrict_to_meetings or wants_summary)) else "none"
 
-    return ask_gpt(query, context=ctx, chat_history=chat_history, structure=structure, max_tokens=out_tokens)
+    return ask_gpt(query, context=ctx, chat_history=chat_history, structure=structure, max_completion_tokens=out_tokens)
 
 # Optional CLI test
 if __name__ == "__main__":
     print(answer("Who is our AI Coordinator this week?", k=4, restrict_to_meetings=True, fast_mode=True))
+
