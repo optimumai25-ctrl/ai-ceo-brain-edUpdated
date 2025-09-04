@@ -12,8 +12,18 @@ google-auth-httplib2
 google-auth-oauthlib
 PyPDF2
 openpyxl
-# requirements.txt (add these if not present)
-duckduckgo-search==6.2.6
-trafilatura==1.9.0
+# Core app
+streamlit==1.36.0
+openai>=1.40.0
+pandas==2.2.2
+numpy==1.26.4
+
+# Vector index (used by your embedding/retrieval pipeline)
+faiss-cpu==1.8.0.post1
+
+# Lightweight web fallback (no heavy native deps)
 requests==2.32.3
 beautifulsoup4==4.12.3
+
+# If you already have other libs for your project, keep them.
+# These versions are chosen to build cleanly on hosted services.
