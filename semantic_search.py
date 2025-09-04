@@ -1,16 +1,15 @@
-import pickle
+# semantic_search.py
+# Cosine-similarity retrieval using NumPy. No FAISS dependency.
+
+from __future__ import annotations
+import os, json
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Dict, Tuple, Iterable
 from datetime import datetime
-import os
 
 import numpy as np
-import faiss
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# Embedding for query
+# OpenAI embeddings (for query vectors)
 try:
     from openai import OpenAI
     _client = OpenAI()
@@ -18,112 +17,106 @@ try:
 except Exception:
     _client = None
     _use_client = False
-    import openai
+    import openai  # type: ignore
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-INDEX_PATH = Path("embeddings/faiss.index")
-META_PATH = Path("embeddings/metadata.pkl")
+EMB_DIR = Path("embeddings")
+VEC_PATH = EMB_DIR / "vectors.npy"
+META_PATH = EMB_DIR / "meta.jsonl"
 
-def _embed_query_client(text: str) -> np.ndarray:
-    resp = _client.embeddings.create(model=EMBED_MODEL, input=text)
-    return np.asarray(resp.data[0].embedding, dtype=np.float32)
+# lazy-loaded globals
+_V = None          # np.ndarray [N, D]
+_VN = None         # normalized
+_META: List[Dict] = []
 
-def _embed_query_legacy(text: str) -> np.ndarray:
-    resp = openai.Embedding.create(model=EMBED_MODEL, input=text)  # type: ignore
-    return np.asarray(resp["data"][0]["embedding"], dtype=np.float32)
+def _load_index():
+    global _V, _VN, _META
+    if _V is not None and _META:
+        return
+    if not VEC_PATH.exists() or not META_PATH.exists():
+        _V, _VN, _META = None, None, []
+        return
+    _V = np.load(VEC_PATH)
+    if _V.size == 0:
+        _V, _VN, _META = None, None, []
+        return
+    _VN = _V / (np.linalg.norm(_V, axis=1, keepdims=True) + 1e-12)
+    _META = []
+    with META_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                _META.append(json.loads(line))
+            except Exception:
+                _META.append({})
+    # pad previews
+    for m in _META:
+        m.setdefault("filename", "unknown.txt")
+        m.setdefault("chunk_id", 0)
+        m.setdefault("text_preview", "")
+        m.setdefault("folder", "")
+        m.setdefault("file_date", None)
 
-def embed_query(text: str) -> np.ndarray:
-    arr = _embed_query_client(text) if _use_client else _embed_query_legacy(text)
-    if arr.shape != (EMBED_DIM,):
-        raise ValueError(f"Unexpected embedding shape {arr.shape}")
-    return arr
+def _embed_query(q: str) -> np.ndarray:
+    if _use_client:
+        resp = _client.embeddings.create(model=EMBED_MODEL, input=[q])  # type: ignore
+        v = np.asarray(resp.data[0].embedding, dtype=np.float32)
+    else:
+        resp = openai.Embedding.create(model=EMBED_MODEL, input=[q])  # type: ignore
+        v = np.asarray(resp["data"][0]["embedding"], dtype=np.float32)
+    v = v / (np.linalg.norm(v) + 1e-12)
+    return v
 
-def load_resources():
-    if not INDEX_PATH.exists() or not META_PATH.exists():
-        raise FileNotFoundError("Missing FAISS index or metadata. Run embed_and_store.py first.")
-    index = faiss.read_index(str(INDEX_PATH))
-    with open(META_PATH, "rb") as f:
-        metadata = pickle.load(f)
-    return index, metadata
-
-def search(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
-    index, metadata = load_resources()
-    qvec = embed_query(query).reshape(1, -1)
-    D, I = index.search(qvec, max(k, 50))
-    out: List[Tuple[int, float, Dict]] = []
-    for dist, idx in zip(D[0], I[0]):
-        if idx == -1: continue
-        out.append((int(idx), float(dist), metadata.get(int(idx), {})))
+def _topk_from_indices(qvec: np.ndarray, indices: Iterable[int], k: int) -> List[Tuple[int, float, Dict]]:
+    idx = np.fromiter(indices, dtype=int)
+    if idx.size == 0:
+        return []
+    sims = _VN[idx] @ qvec
+    top = np.argsort(-sims)[:k]
+    out = []
+    for j in top:
+        i = int(idx[j])
+        out.append((i, float(sims[j]), _META[i]))
     return out
 
-def _parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s: return None
-    try: return datetime.strptime(s, "%Y-%m-%d")
-    except Exception: return None
+def _all_indices() -> Iterable[int]:
+    return range(len(_META))
 
-def _query_tags(query: str) -> List[str]:
-    toks = [t.strip(",.?:;!()[]").lower() for t in query.split()]
-    vocab = {"hr","hiring","recruiting","finance","budget","expense","policy","product","engineering","data","sales","ops","legal","org","roles","ai","coordinator"}
-    return [t for t in toks if t in vocab]
+def _date_to_dt(iso: str | None):
+    if not iso:
+        return None
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d")
+    except Exception:
+        return None
 
-def rerank(results: List[Tuple[int, float, Dict]], query: str, prefer_meetings: bool = False, prefer_recent: bool = False) -> List[Tuple[int,float,Dict]]:
-    qtags = set(_query_tags(query))
-    now = datetime.now()
-
-    def score(item):
-        _, dist, meta = item
-        base = -dist  # smaller distance → larger score
-        folder = str(meta.get("folder","")).lower()
-
-        # Meetings recency
-        meet_date = _parse_iso(meta.get("meeting_date"))
-        meet_bonus = (meet_date.toordinal()*10) if (prefer_recent and meet_date) else 0
-        folder_bonus = 1000 if (prefer_meetings and folder == "meetings") else 0
-
-        # Reminders: tag overlap + validity
-        tags = set((meta.get("tags") or []))
-        tag_overlap = len(qtags & {t.lower() for t in tags})
-        tag_bonus = tag_overlap * 500
-
-        vfrom = _parse_iso(meta.get("valid_from"))
-        vto = _parse_iso(meta.get("valid_to"))
-        valid_now = True
-        if vfrom and now < vfrom: valid_now = False
-        if vto and now > vto: valid_now = False
-        validity_bonus = 0 if valid_now else -1000
-
-        return folder_bonus*1_000_000 + meet_bonus + tag_bonus + validity_bonus + base
-
-    return sorted(results, key=score, reverse=True)
-
-def search_meetings(query: str, k: int = 5, prefer_recent: bool = True) -> List[Tuple[int, float, Dict]]:
-    raw = search(query, k=max(k, 100))
-    re_ranked = rerank(raw, query=query, prefer_meetings=True, prefer_recent=prefer_recent)
-    return re_ranked[:k]
-
-def filter_by_date_range(results: List[Tuple[int, float, Dict]], start: datetime, end: datetime) -> List[Tuple[int, float, Dict]]:
-    kept: List[Tuple[int, float, Dict]] = []
-    for rid, dist, meta in results:
-        d = _parse_iso(meta.get("meeting_date"))
-        if d and start <= d <= end:
-            kept.append((rid, dist, meta))
-    return kept
-
-def rerank_for_recency(results: List[Tuple[int, float, Dict]], query: str, favor_recent: bool = True) -> List[Tuple[int, float, Dict]]:
-    return rerank(results, query=query, prefer_meetings=False, prefer_recent=favor_recent)
-
-def search_in_date_window(query: str, start: datetime, end: datetime, k: int = 5) -> List[Tuple[int, float, Dict]]:
-    pool = search(query, k=max(k, 200))
-    windowed = filter_by_date_range(pool, start, end)
-    if not windowed:
+# ─────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────
+def search(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
+    _load_index()
+    if _VN is None or not _META:
         return []
-    return rerank_for_recency(windowed, query=query)[:k]
+    qvec = _embed_query(query)
+    return _topk_from_indices(qvec, _all_indices(), k)
 
-if __name__ == "__main__":
-    hits = search_meetings("hr hiring policy last month", k=5)
-    for i, (vid, dist, meta) in enumerate(hits, 1):
-        print(f"{i}. dist={dist:.4f} file={meta.get('filename')} folder={meta.get('folder')} tags={meta.get('tags')} valid_from={meta.get('valid_from')} valid_to={meta.get('valid_to')}")
-        print(meta.get("text_preview","")[:160], "\n---")
+def search_meetings(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
+    _load_index()
+    if _VN is None or not _META:
+        return []
+    qvec = _embed_query(query)
+    indices = [i for i, m in enumerate(_META) if (m.get("folder","").lower() == "meetings")]
+    return _topk_from_indices(qvec, indices, k)
+
+def search_in_date_window(query: str, start_dt: datetime, end_dt: datetime, k: int = 5) -> List[Tuple[int, float, Dict]]:
+    _load_index()
+    if _VN is None or not _META:
+        return []
+    qvec = _embed_query(query)
+    indices: List[int] = []
+    for i, m in enumerate(_META):
+        dt = _date_to_dt(m.get("file_date"))
+        if dt and (start_dt <= dt <= end_dt):
+            indices.append(i)
+    return _topk_from_indices(qvec, indices, k)
