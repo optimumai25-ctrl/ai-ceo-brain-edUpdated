@@ -162,8 +162,39 @@ def is_generative(q: str) -> bool:
     return bool(_GEN_PAT.search(q))
 
 # ─────────────────────────────────────────────────────────────
-# Chat Completion (GPT-5: use max_completion_tokens; no temperature)
+# Chat Completion (GPT-5: use max_completion_tokens on new SDK; no temperature)
 # ─────────────────────────────────────────────────────────────
+def _extract_text(resp) -> str:
+    """
+    Robustly extract text from Chat Completions response.
+    Handles cases where content may be empty or structured.
+    """
+    try:
+        content = resp.choices[0].message.content
+        if content:
+            return content
+    except Exception:
+        pass
+
+    # Fallback: some SDKs might return structured content lists
+    try:
+        mc = getattr(resp.choices[0].message, "content", None)
+        if isinstance(mc, list):
+            parts = []
+            for p in mc:
+                if isinstance(p, dict):
+                    t = p.get("text")
+                    if t:
+                        parts.append(t)
+                elif isinstance(p, str):
+                    parts.append(p)
+            if parts:
+                return "".join(parts)
+    except Exception:
+        pass
+
+    return "[No text returned by the model.]"
+
 def ask_gpt(
     query: str,
     context: str = "",
@@ -195,17 +226,18 @@ def ask_gpt(
 
     messages.append({"role": "user", "content": f"Query:\n{query}\n\nSources:\n{context}"} if context else {"role": "user", "content": query})
 
-    # IMPORTANT: GPT-5 expects max_completion_tokens (not max_tokens)
-    kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
-    if max_completion_tokens is not None:
-        kwargs["max_completion_tokens"] = max_completion_tokens
-
+    # Build kwargs per SDK path
     if _use_client:
+        kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
+        if max_completion_tokens is not None:
+            kwargs["max_completion_tokens"] = max_completion_tokens
         resp = _client.chat.completions.create(**kwargs)  # type: ignore
-        return resp.choices[0].message.content
+        return _extract_text(resp)
     else:
+        # Legacy client: do NOT pass max_* tokens for GPT-5 (unsupported there)
+        kwargs = dict(model=COMPLETIONS_MODEL, messages=messages[-6:])
         resp = openai.ChatCompletion.create(**kwargs)  # type: ignore
-        return resp.choices[0].message["content"]
+        return _extract_text(resp)
 
 # ─────────────────────────────────────────────────────────────
 # Public API (fallbacks A & B, fast-mode aware)
@@ -227,7 +259,7 @@ def answer(
         B) Date-window returns no hits → general search (no window).
     - Fast mode:
         * Smaller RAG context
-        * Shorter output via max_completion_tokens
+        * Shorter output via max_completion_tokens (new SDK path)
         * Less history
     """
     # Fast-mode caps
@@ -285,4 +317,3 @@ def answer(
 # Optional CLI test
 if __name__ == "__main__":
     print(answer("Who is our AI Coordinator this week?", k=4, restrict_to_meetings=True, fast_mode=True))
-
