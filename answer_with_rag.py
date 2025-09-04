@@ -9,7 +9,7 @@ from semantic_search import (
     search_in_date_window,
 )
 
-# NEW: general public web search fallback
+# General public web search fallback
 from public_lookup import web_answer
 
 # OpenAI client setup (new SDK preferred, fallback legacy)
@@ -48,7 +48,7 @@ def build_context(topk: List[Tuple[int, float, Dict]]) -> str:
     return "\n".join(parts)
 
 # ─────────────────────────────────────────────────────────────
-# Date-window resolution from user query (extended)
+# Date-window resolution (extended)
 # ─────────────────────────────────────────────────────────────
 _MONTHS = "(january|february|march|april|may|june|july|august|september|october|november|december)"
 _Q_PAT = re.compile(r"\bq([1-4])\s*(?:[-/ ]?\s*)?(20\d{2})\b", re.I)
@@ -178,7 +178,7 @@ def ask_gpt(
         return resp.choices[0].message["content"]
 
 # ─────────────────────────────────────────────────────────────
-# Public API (RAG first → web fallback → GPT)
+# Public API (RAG → web fallback → GPT)
 # ─────────────────────────────────────────────────────────────
 def answer(
     query: str,
