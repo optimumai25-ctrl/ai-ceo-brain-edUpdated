@@ -180,12 +180,25 @@ elif mode == "💬 New Chat":
     st.caption("📎 Ask about meetings, projects, policies. Start a message with **REMINDER:** to teach facts.")
     st.markdown(f"🕒 Last Refreshed: **{load_refresh_time()}**")
 
-    # Retrieval controls
+    # Persisted defaults for toggles (Meetings OFF, RAG ON)
+    if "limit_meetings" not in st.session_state:
+        st.session_state["limit_meetings"] = False
+    if "use_rag" not in st.session_state:
+        st.session_state["use_rag"] = True
+
     colA, colB = st.columns([1, 1])
     with colA:
-        limit_meetings = st.checkbox("🗂️ Limit retrieval to Meetings", value=False)
+        limit_meetings = st.checkbox(
+            "🗂️ Limit retrieval to Meetings",
+            value=st.session_state["limit_meetings"],
+            key="limit_meetings",
+        )
     with colB:
-        use_rag = st.checkbox("📚 Use internal knowledge (RAG)", value=True)
+        use_rag = st.checkbox(
+            "📚 Use internal knowledge (RAG)",
+            value=st.session_state["use_rag"],
+            key="use_rag",
+        )
 
     # Show prior turns
     history = load_history()
@@ -210,13 +223,12 @@ elif mode == "💬 New Chat":
         with st.chat_message("assistant"):
             with st.spinner("🤔 Thinking…"):
                 try:
-                    # Prefer the new answer() signature with use_rag
                     reply = answer(
                         user_msg,
                         k=7,
                         chat_history=history,
-                        restrict_to_meetings=limit_meetings,
-                        use_rag=use_rag,
+                        restrict_to_meetings=st.session_state["limit_meetings"],
+                        use_rag=st.session_state["use_rag"],
                     )
                 except TypeError:
                     # Backward compatible with older answer() signature
@@ -224,7 +236,7 @@ elif mode == "💬 New Chat":
                         user_msg,
                         k=7,
                         chat_history=history,
-                        restrict_to_meetings=limit_meetings,
+                        restrict_to_meetings=st.session_state["limit_meetings"],
                     )
                 except Exception as e:
                     reply = f"Error: {e}"
