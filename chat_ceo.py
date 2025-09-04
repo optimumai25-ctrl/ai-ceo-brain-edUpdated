@@ -185,6 +185,8 @@ elif mode == "💬 New Chat":
         st.session_state["limit_meetings"] = False
     if "use_rag" not in st.session_state:
         st.session_state["use_rag"] = True
+
+    # If you kept fast_mode in your previous build, add it back; else omit:
     if "fast_mode" not in st.session_state:
         st.session_state["fast_mode"] = True
 
@@ -234,17 +236,17 @@ elif mode == "💬 New Chat":
                 try:
                     reply = answer(
                         user_msg,
-                        k=(4 if st.session_state["fast_mode"] else 7),
+                        k=(4 if st.session_state.get("fast_mode", True) else 7),
                         chat_history=history,
                         restrict_to_meetings=st.session_state["limit_meetings"],
                         use_rag=st.session_state["use_rag"],
-                        fast_mode=st.session_state["fast_mode"],
+                        fast_mode=st.session_state.get("fast_mode", True),
                     )
                 except TypeError:
                     # Backward compatibility with older answer() signature
                     reply = answer(
                         user_msg,
-                        k=(4 if st.session_state["fast_mode"] else 7),
+                        k=(4 if st.session_state.get("fast_mode", True) else 7),
                         chat_history=history,
                         restrict_to_meetings=st.session_state["limit_meetings"],
                     )
@@ -255,4 +257,3 @@ elif mode == "💬 New Chat":
 
         history.append({"role": "assistant", "content": reply, "timestamp": ts})
         save_history(history)
-
