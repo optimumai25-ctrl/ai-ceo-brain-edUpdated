@@ -18,12 +18,7 @@ openai>=1.40.0
 pandas==2.2.2
 numpy==1.26.4
 
-# Vector index (used by your embedding/retrieval pipeline)
-faiss-cpu==1.8.0.post1
-
-# Lightweight web fallback (no heavy native deps)
+# Lightweight web fallback
 requests==2.32.3
 beautifulsoup4==4.12.3
 
-# If you already have other libs for your project, keep them.
-# These versions are chosen to build cleanly on hosted services.
