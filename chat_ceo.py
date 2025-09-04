@@ -180,13 +180,15 @@ elif mode == "💬 New Chat":
     st.caption("📎 Ask about meetings, projects, policies. Start a message with **REMINDER:** to teach facts.")
     st.markdown(f"🕒 Last Refreshed: **{load_refresh_time()}**")
 
-    # Persisted defaults for toggles (Meetings OFF, RAG ON)
+    # Persisted defaults for toggles (Meetings OFF, RAG ON, Fast mode ON)
     if "limit_meetings" not in st.session_state:
         st.session_state["limit_meetings"] = False
     if "use_rag" not in st.session_state:
         st.session_state["use_rag"] = True
+    if "fast_mode" not in st.session_state:
+        st.session_state["fast_mode"] = True
 
-    colA, colB = st.columns([1, 1])
+    colA, colB, colC = st.columns([1, 1, 1])
     with colA:
         limit_meetings = st.checkbox(
             "🗂️ Limit retrieval to Meetings",
@@ -198,6 +200,13 @@ elif mode == "💬 New Chat":
             "📚 Use internal knowledge (RAG)",
             value=st.session_state["use_rag"],
             key="use_rag",
+        )
+    with colC:
+        fast_mode = st.checkbox(
+            "⚡ Fast mode",
+            value=st.session_state["fast_mode"],
+            key="fast_mode",
+            help="Shorter context + capped output for faster GPT-5 replies",
         )
 
     # Show prior turns
@@ -225,16 +234,17 @@ elif mode == "💬 New Chat":
                 try:
                     reply = answer(
                         user_msg,
-                        k=7,
+                        k=(4 if st.session_state["fast_mode"] else 7),
                         chat_history=history,
                         restrict_to_meetings=st.session_state["limit_meetings"],
                         use_rag=st.session_state["use_rag"],
+                        fast_mode=st.session_state["fast_mode"],
                     )
                 except TypeError:
-                    # Backward compatible with older answer() signature
+                    # Backward compatibility with older answer() signature
                     reply = answer(
                         user_msg,
-                        k=7,
+                        k=(4 if st.session_state["fast_mode"] else 7),
                         chat_history=history,
                         restrict_to_meetings=st.session_state["limit_meetings"],
                     )
@@ -245,3 +255,4 @@ elif mode == "💬 New Chat":
 
         history.append({"role": "assistant", "content": reply, "timestamp": ts})
         save_history(history)
+
