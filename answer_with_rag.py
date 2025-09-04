@@ -211,7 +211,7 @@ def ask_gpt(
         return resp.choices[0].message["content"]
 
 # ─────────────────────────────────────────────────────────────
-# Public API
+# Public API (with strong fallbacks A & B)
 # ─────────────────────────────────────────────────────────────
 def answer(
     query: str,
@@ -224,38 +224,53 @@ def answer(
     - Detects relative/specific dates and restricts retrieval to that window when found.
     - Skips retrieval entirely for generative asks or when use_rag=False.
     - Structures meeting digests when appropriate (Agenda / Decisions / Action Items).
-    - **Fallback B:** if restrict_to_meetings=True but no meeting hits are found, fall back to general search.
+    - Fallbacks:
+        A) If restrict_to_meetings=True but we got no meeting hits, fall back to general search.
+        B) If a date window is requested but returns no hits, fall back to general search (no window).
     """
     # Generative bypass or explicit GPT-only mode
     if not use_rag or is_generative(query):
         return ask_gpt(query, context="", chat_history=chat_history, structure="none")
 
-    # Date-scoped search if query contains a window
+    def _has_meeting_hits(hs):
+        for _, _, meta in hs or []:
+            if (meta.get("folder", "") or "").lower() == "meetings":
+                return True
+        return False
+
+    hits = []
+
+    # 1) Date-scoped search if query contains a window
     win = resolve_date_window_from_query(query)
     if win:
         start, end = win
         hits = search_in_date_window(query, start, end, k=k)
+
+        # Fallback B: date window yielded nothing → try general search (no window)
+        if not hits:
+            hits = search(query, k=k)
+
+        # Fallback A (in date path): forced meetings but no meeting hits → try general search
+        if restrict_to_meetings and not _has_meeting_hits(hits):
+            alt = search(query, k=k)
+            if alt:
+                hits = alt
     else:
+        # 2) No date window → prefer meetings only if user asked
         hits = search_meetings(query, k=k) if restrict_to_meetings else search(query, k=k)
 
-        # ── Fallback B: user forced meetings but none found → try general search
-        def _has_meeting_hits(hs):
-            for _, _, meta in hs:
-                if (meta.get("folder", "") or "").lower() == "meetings":
-                    return True
-            return False
-
-        if restrict_to_meetings and (not hits or not _has_meeting_hits(hits)):
+        # Fallback A (no date path): meetings requested but not actually meeting hits
+        if restrict_to_meetings and not _has_meeting_hits(hits):
             alt = search(query, k=k)
             if alt:
                 hits = alt
 
+    # If nothing usable, answer without sources
     if not hits:
         return ask_gpt(query, context="", chat_history=chat_history, structure="none")
 
+    # Build context and choose structure
     ctx = build_context(hits)
-
-    # Heuristic for structured meeting output
     is_meeting_ctx = any((meta.get("folder", "").lower() == "meetings") for _, _, meta in hits)
     wants_summary = bool(re.search(r"\b(summary|summarize|decisions?|action items?)\b", query, re.I))
     structure = "meeting_summary" if (is_meeting_ctx and (restrict_to_meetings or wants_summary)) else "none"
@@ -264,4 +279,4 @@ def answer(
 
 # Optional CLI test
 if __name__ == "__main__":
-    print(answer("Summarize decisions from this week.", k=7, restrict_to_meetings=True))
+    print(answer("Who is our AI Coordinator this week?", k=7, restrict_to_meetings=True))
