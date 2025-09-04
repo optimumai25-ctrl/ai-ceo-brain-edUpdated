@@ -159,7 +159,7 @@ def is_generative(q: str) -> bool:
     return bool(_GEN_PAT.search(q))
 
 # ─────────────────────────────────────────────────────────────
-# Chat Completion
+# Chat Completion (no temperature for GPT-5)
 # ─────────────────────────────────────────────────────────────
 def ask_gpt(
     query: str,
@@ -196,18 +196,17 @@ def ask_gpt(
     else:
         messages.append({"role": "user", "content": query})
 
+    # IMPORTANT: no temperature passed for GPT-5
     if _use_client:
         resp = _client.chat.completions.create(  # type: ignore
             model=COMPLETIONS_MODEL,
             messages=messages[-6:],
-            temperature=0.2,
         )
         return resp.choices[0].message.content
     else:
         resp = openai.ChatCompletion.create(  # type: ignore
             model=COMPLETIONS_MODEL,
             messages=messages[-6:],
-            temperature=0.2,
         )
         return resp.choices[0].message["content"]
 
