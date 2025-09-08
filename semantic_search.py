@@ -1,129 +1,202 @@
-import pickle
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-from datetime import datetime
 import os
-
+import pickle
+import math
+from typing import List, Tuple, Dict, Callable, Optional
+from datetime import datetime
 import numpy as np
-import faiss
-from dotenv import load_dotenv
 
-load_dotenv()
+# FAISS
+try:
+    import faiss  # type: ignore
+except Exception as e:
+    faiss = None
 
-# Embedding for query
+# OpenAI embeddings
 try:
     from openai import OpenAI
-    _client = OpenAI()
-    _use_client = True
+    _eclient = OpenAI()
+    _use_eclient = True
 except Exception:
-    _client = None
-    _use_client = False
-    import openai
+    _eclient = None
+    _use_eclient = False
+    import openai  # type: ignore
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536
+# Paths
+DATA_DIR = os.getenv("DATA_DIR", ".")
+EMB_DIR = os.path.join(DATA_DIR, "embeddings")
+FAISS_PATH = os.path.join(EMB_DIR, "index.faiss")
+META_PATH = os.path.join(EMB_DIR, "metadata.pkl")
 
-INDEX_PATH = Path("embeddings/faiss.index")
-META_PATH = Path("embeddings/metadata.pkl")
+# Embedding model
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
 
-def _embed_query_client(text: str) -> np.ndarray:
-    resp = _client.embeddings.create(model=EMBED_MODEL, input=text)
-    return np.asarray(resp.data[0].embedding, dtype=np.float32)
+# Cache
+_index = None
+_meta: List[Dict] = []
+_dim = None
+_ip_index = False  # whether index is inner-product
 
-def _embed_query_legacy(text: str) -> np.ndarray:
-    resp = openai.Embedding.create(model=EMBED_MODEL, input=text)  # type: ignore
-    return np.asarray(resp["data"][0]["embedding"], dtype=np.float32)
+# ─────────────────────────────────────────────────────────────
+# Loading
+# ─────────────────────────────────────────────────────────────
+def _load_index_and_meta():
+    global _index, _meta, _dim, _ip_index
+    if _index is not None and _meta:
+        return
 
-def embed_query(text: str) -> np.ndarray:
-    arr = _embed_query_client(text) if _use_client else _embed_query_legacy(text)
-    if arr.shape != (EMBED_DIM,):
-        raise ValueError(f"Unexpected embedding shape {arr.shape}")
-    return arr
+    if faiss is None:
+        raise RuntimeError("faiss is not installed. Install faiss-cpu in requirements.txt.")
 
-def load_resources():
-    if not INDEX_PATH.exists() or not META_PATH.exists():
-        raise FileNotFoundError("Missing FAISS index or metadata. Run embed_and_store.py first.")
-    index = faiss.read_index(str(INDEX_PATH))
+    if not os.path.exists(FAISS_PATH):
+        raise FileNotFoundError(f"FAISS index not found at {FAISS_PATH}")
+    if not os.path.exists(META_PATH):
+        raise FileNotFoundError(f"Metadata not found at {META_PATH}")
+
+    _index = faiss.read_index(FAISS_PATH)
     with open(META_PATH, "rb") as f:
-        metadata = pickle.load(f)
-    return index, metadata
+        _meta = pickle.load(f)
+    # Infer dim and metric
+    _dim = _index.d if hasattr(_index, "d") else None
+    try:
+        _ip_index = isinstance(_index, faiss.IndexFlatIP) or _index.metric_type == faiss.METRIC_INNER_PRODUCT
+    except Exception:
+        _ip_index = False
 
-def search(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
-    index, metadata = load_resources()
-    qvec = embed_query(query).reshape(1, -1)
-    D, I = index.search(qvec, max(k, 50))
-    out: List[Tuple[int, float, Dict]] = []
-    for dist, idx in zip(D[0], I[0]):
-        if idx == -1: continue
-        out.append((int(idx), float(dist), metadata.get(int(idx), {})))
-    return out
+# ─────────────────────────────────────────────────────────────
+# Embedding
+# ─────────────────────────────────────────────────────────────
+def _embed(text: str) -> np.ndarray:
+    text = text.replace("\n", " ").strip()
+    if _use_eclient:
+        v = _eclient.embeddings.create(model=EMBEDDING_MODEL, input=text).data[0].embedding  # type: ignore
+    else:
+        v = openai.Embedding.create(model=EMBEDDING_MODEL, input=[text])["data"][0]["embedding"]  # type: ignore
+    vec = np.array(v, dtype=np.float32)
+    # Normalize for cosine/IP if index is IP
+    return vec / (np.linalg.norm(vec) + 1e-12) if _ip_index else vec
 
-def _parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s: return None
-    try: return datetime.strptime(s, "%Y-%m-%d")
-    except Exception: return None
+# ─────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────
+def _parse_iso(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(dt_str[:19], fmt)
+        except Exception:
+            continue
+    return None
 
-def _query_tags(query: str) -> List[str]:
-    toks = [t.strip(",.?:;!()[]").lower() for t in query.split()]
-    vocab = {"hr","hiring","recruiting","finance","budget","expense","policy","product","engineering","data","sales","ops","legal","org","roles","ai","coordinator"}
-    return [t for t in toks if t in vocab]
+def _in_range(dt: Optional[datetime], start: datetime, end: datetime) -> bool:
+    if not dt:
+        return False
+    return start <= dt <= end
 
-def rerank(results: List[Tuple[int, float, Dict]], query: str, prefer_meetings: bool = False, prefer_recent: bool = False) -> List[Tuple[int,float,Dict]]:
-    qtags = set(_query_tags(query))
+def _default_filter(_: Dict) -> bool:
+    return True
+
+# ─────────────────────────────────────────────────────────────
+# Core search + rerank
+# ─────────────────────────────────────────────────────────────
+def _search_core(query: str,
+                 k: int,
+                 filter_fn: Callable[[Dict], bool] = _default_filter,
+                 prefer_meetings: bool = False,
+                 prefer_recent: bool = False) -> List[Tuple[int, float, Dict]]:
+    _load_index_and_meta()
+    qv = _embed(query).reshape(1, -1)
+
+    # raw search
+    D, I = _index.search(qv, min(k * 8, max(32, k * 4)))  # ask for more, then filter/rerank
+    results = []
+    for rank, (idx, dist) in enumerate(zip(I[0], D[0])):
+        if idx < 0 or idx >= len(_meta):
+            continue
+        meta = _meta[idx]
+        if not filter_fn(meta):
+            continue
+        results.append((idx, float(dist), meta))
+
+    if not results:
+        return []
+
+    # rerank
+    results = rerank(results, query, prefer_meetings=prefer_meetings, prefer_recent=prefer_recent)
+    return results[:k]
+
+def rerank(results: List[Tuple[int, float, Dict]],
+           query: str,
+           prefer_meetings: bool = False,
+           prefer_recent: bool = False) -> List[Tuple[int, float, Dict]]:
+    """
+    Gentle preferences:
+      - Meetings get a small boost if requested.
+      - Newer meeting_date gets a small boost if prefer_recent.
+      - ValidTo in the past gets a penalty.
+    We do NOT swamp the base similarity (keeps Reminders competitive).
+    """
     now = datetime.now()
 
-    def score(item):
+    def score(item, rank0: int):
         _, dist, meta = item
-        base = -dist  # smaller distance → larger score
-        folder = str(meta.get("folder","")).lower()
 
-        # Meetings recency
-        meet_date = _parse_iso(meta.get("meeting_date"))
-        meet_bonus = (meet_date.toordinal()*10) if (prefer_recent and meet_date) else 0
-        folder_bonus = 1000 if (prefer_meetings and folder == "meetings") else 0
+        # Base from returned order (higher is better)
+        base = 1000 - rank0  # simple monotonic tie-breaker
 
-        # Reminders: tag overlap + validity
-        tags = set((meta.get("tags") or []))
-        tag_overlap = len(qtags & {t.lower() for t in tags})
-        tag_bonus = tag_overlap * 500
+        folder = str(meta.get("folder", "")).lower()
+        folder_bonus = 50 if (prefer_meetings and folder == "meetings") else 0  # << gentle
 
-        vfrom = _parse_iso(meta.get("valid_from"))
-        vto = _parse_iso(meta.get("valid_to"))
-        valid_now = True
-        if vfrom and now < vfrom: valid_now = False
-        if vto and now > vto: valid_now = False
-        validity_bonus = 0 if valid_now else -1000
+        # Recency bonus (meetings only if date present)
+        meet_dt = _parse_iso(meta.get("meeting_date"))
+        recency_bonus = 0
+        if prefer_recent and meet_dt:
+            # newer → bigger bonus, capped
+            days_ago = (now - meet_dt).days
+            recency_bonus = max(0, 200 - min(200, days_ago))  # 0..200
 
-        return folder_bonus*1_000_000 + meet_bonus + tag_bonus + validity_bonus + base
+        # Validity window for reminders (if present)
+        valid_from = _parse_iso(meta.get("valid_from"))
+        valid_to = _parse_iso(meta.get("valid_to"))
+        validity_bonus = 0
+        if valid_from and valid_from > now:
+            validity_bonus -= 100
+        if valid_to and valid_to < now:
+            validity_bonus -= 200  # expired reminder → downweight
 
-    return sorted(results, key=score, reverse=True)
+        return base + folder_bonus + recency_bonus + validity_bonus
 
-def search_meetings(query: str, k: int = 5, prefer_recent: bool = True) -> List[Tuple[int, float, Dict]]:
-    raw = search(query, k=max(k, 100))
-    re_ranked = rerank(raw, query=query, prefer_meetings=True, prefer_recent=prefer_recent)
-    return re_ranked[:k]
+    scored = [(score(item, rnk), item) for rnk, item in enumerate(results)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, it in scored]
 
-def filter_by_date_range(results: List[Tuple[int, float, Dict]], start: datetime, end: datetime) -> List[Tuple[int, float, Dict]]:
-    kept: List[Tuple[int, float, Dict]] = []
-    for rid, dist, meta in results:
-        d = _parse_iso(meta.get("meeting_date"))
-        if d and start <= d <= end:
-            kept.append((rid, dist, meta))
-    return kept
+# ─────────────────────────────────────────────────────────────
+# Public APIs
+# ─────────────────────────────────────────────────────────────
+def search(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
+    """
+    General semantic search across all folders (Reminders, Meetings, Finance, etc.).
+    """
+    return _search_core(query, k=k, filter_fn=_default_filter, prefer_meetings=False, prefer_recent=False)
 
-def rerank_for_recency(results: List[Tuple[int, float, Dict]], query: str, favor_recent: bool = True) -> List[Tuple[int, float, Dict]]:
-    return rerank(results, query=query, prefer_meetings=False, prefer_recent=favor_recent)
+def search_meetings(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
+    """
+    Prefer Meetings. Still allows others if caller blends separately.
+    """
+    def filt(meta: Dict) -> bool:
+        # We don't *hard* filter here; caller can blend/remix.
+        return True
+    return _search_core(query, k=k, filter_fn=filt, prefer_meetings=True, prefer_recent=True)
 
 def search_in_date_window(query: str, start: datetime, end: datetime, k: int = 5) -> List[Tuple[int, float, Dict]]:
-    pool = search(query, k=max(k, 200))
-    windowed = filter_by_date_range(pool, start, end)
-    if not windowed:
-        return []
-    return rerank_for_recency(windowed, query=query)[:k]
+    """
+    Date-scoped search: focuses on items with a 'meeting_date' within [start, end].
+    Typically Meetings; Reminders lack dates, so they won't appear here.
+    (answer_with_rag.py blends these with general search so Reminders are not ignored.)
+    """
+    def filt(meta: Dict) -> bool:
+        dt = _parse_iso(meta.get("meeting_date"))
+        return _in_range(dt, start, end)
+    return _search_core(query, k=k, filter_fn=filt, prefer_meetings=True, prefer_recent=True)
 
-if __name__ == "__main__":
-    hits = search_meetings("hr hiring policy last month", k=5)
-    for i, (vid, dist, meta) in enumerate(hits, 1):
-        print(f"{i}. dist={dist:.4f} file={meta.get('filename')} folder={meta.get('folder')} tags={meta.get('tags')} valid_from={meta.get('valid_from')} valid_to={meta.get('valid_to')}")
-        print(meta.get("text_preview","")[:160], "\n---")
