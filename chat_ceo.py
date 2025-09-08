@@ -82,13 +82,11 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
     reminders_dir.mkdir(exist_ok=True)
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M")
-    # Prefer an explicit title, else first line of content
     title = (title_hint or content.strip().split("\n", 1)[0][:60] or "Untitled").strip()
     safe_title = re.sub(r"[^A-Za-z0-9_\-]+", "_", title) or "Untitled"
 
     fp = reminders_dir / f"{ts}_{safe_title}.txt"
 
-    # If content already includes Title:/Tags:/ValidFrom:/Body:, keep it as-is
     is_structured = bool(re.search(r"(?mi)^\s*Title:|^\s*Tags:|^\s*ValidFrom:|^\s*Body:", content))
     if is_structured:
         payload = content.strip() + "\n"
@@ -119,7 +117,8 @@ with st.sidebar.expander("📊 Index health (embeddings)"):
             bad = df[(df["chunks"] == 0) | (df["chars"] < 200)]
             if len(bad):
                 st.warning(f"⚠️ {len(bad)} file(s) look sparse (<200 chars or 0 chunks).")
-        st.dataframe(df.tail(50), use_container_width=True, height=220)
+        # UPDATED: use width instead of deprecated use_container_width
+        st.dataframe(df.tail(50), width="stretch", height=220)
     except Exception:
         st.caption("ℹ️ No report yet. Run **Refresh Data**.")
 
