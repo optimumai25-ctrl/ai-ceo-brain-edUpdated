@@ -27,14 +27,17 @@ MAX_CONTEXT_CHARS = 8000
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
-def _merge_dedup(a: List[Tuple[int,float,Dict]],
-                 b: List[Tuple[int,float,Dict]],
-                 limit: int) -> List[Tuple[int,float,Dict]]:
-    """Stable merge by vector id, keep order, cap to limit."""
+def _merge_dedup(a: List[Tuple[int, float, Dict]],
+                 b: List[Tuple[int, float, Dict]],
+                 limit: int) -> List[Tuple[int, float, Dict]]:
+    """
+    Stable merge by vector id, keep order, cap to limit.
+    Ensures date-window results (Meetings) and general results (Reminders/others) are blended.
+    """
     seen, out = set(), []
     for lst in (a, b):
         for rid, dist, meta in lst:
-            if rid in seen: 
+            if rid in seen:
                 continue
             out.append((rid, dist, meta))
             seen.add(rid)
@@ -43,6 +46,9 @@ def _merge_dedup(a: List[Tuple[int,float,Dict]],
     return out[:limit]
 
 def build_context(topk: List[Tuple[int, float, Dict]]) -> str:
+    """
+    Compact context: [SOURCE: filename | CHUNK: id] + snippet.
+    """
     parts, total = [], 0
     for _, _, meta in topk:
         fname = meta.get("filename", "unknown.txt")
@@ -62,10 +68,10 @@ _MONTHS = "(january|february|march|april|may|june|july|august|september|october|
 _Q_PAT = re.compile(r"\bq([1-4])\s*(?:[-/ ]?\s*)?(20\d{2})\b", re.I)
 
 def _quarter_bounds(q: int, year: int):
-    starts = {1: (1,1), 2:(4,1), 3:(7,1), 4:(10,1)}
+    starts = {1: (1, 1), 2: (4, 1), 3: (7, 1), 4: (10, 1)}
     sm, sd = starts[q]
     if q < 4:
-        em, ed = starts[q+1]
+        em, ed = starts[q + 1]
         end = datetime(year, em, ed) - timedelta(days=1)
     else:
         end = datetime(year, 12, 31)
@@ -76,6 +82,16 @@ def _quarter_bounds(q: int, year: int):
     )
 
 def resolve_date_window_from_query(q: str):
+    """
+    Recognize:
+      - 'this week', 'last week'  (Mon..Sun; 'this week' ends at now)
+      - 'this month', 'last month'
+      - 'this quarter'
+      - 'Q1 2025', 'Q3-2025', 'Q4/2026'
+      - 'YYYY-MM-DD'
+      - 'September 2, 2025'
+    Returns (start_dt, end_dt) or None.
+    """
     s = q.lower().strip()
     today = datetime.now()
 
