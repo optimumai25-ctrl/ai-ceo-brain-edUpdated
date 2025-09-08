@@ -1,5 +1,6 @@
 import json
 import re
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -141,6 +142,39 @@ if mode == "🔁 Refresh Data":
     st.caption("📥 Parses local reminders + (optional) Google Drive docs, then 🧩 re-embeds.")
     st.markdown(f"🕒 Last Refreshed: **{load_refresh_time()}**")
 
+    # Diagnostics panel (paths, counts, and force rebuild)
+    with st.expander("🧪 Diagnostics"):
+        import os, glob, time
+        base = os.getenv("DATA_DIR", ".")
+        def _fmt(p):
+            try:
+                sz = os.path.getsize(p)
+                mt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(p)))
+                return f"{p}  (size={sz} bytes, mtime={mt})"
+            except Exception:
+                return f"{p}  (missing)"
+
+        st.write("cwd:", os.getcwd())
+        st.write("DATA_DIR:", base)
+        st.write("Embeddings dir exists:", os.path.exists(os.path.join(base, "embeddings")))
+        st.write("Index file:", _fmt(os.path.join(base, "embeddings", "faiss.index")))
+        st.write("Metadata:", _fmt(os.path.join(base, "embeddings", "metadata.pkl")))
+        st.write("Reminders:", len(glob.glob(os.path.join(base, "reminders", "*.txt"))))
+        st.write("Parsed data:", len(glob.glob(os.path.join(base, "parsed_data", "*.txt"))))
+
+        if st.button("🛠️ Force rebuild FAISS"):
+            try:
+                # Optional: wipe existing files to rebuild cleanly
+                for p in [os.path.join(base, "embeddings", "faiss.index"),
+                          os.path.join(base, "embeddings", "metadata.pkl")]:
+                    if os.path.exists(p):
+                        os.remove(p)
+                file_parser.main()
+                embed_and_store.main()
+                st.success("✅ FAISS rebuilt successfully.")
+            except Exception as e:
+                st.exception(e)
+
     if st.button("🚀 Run File Parser + Embedder"):
         with st.spinner("⏳ Refreshing knowledge base..."):
             try:
@@ -150,6 +184,7 @@ if mode == "🔁 Refresh Data":
                 st.success("✅ Data refreshed and embedded successfully.")
                 st.markdown(f"🕒 Last Refreshed: **{load_refresh_time()}**")
             except Exception as e:
+                st.exception(e)
                 st.error(f"❌ Failed: {e}")
 
 elif mode == "📜 View History":
@@ -238,7 +273,14 @@ elif mode == "💬 New Chat":
                         restrict_to_meetings=st.session_state["limit_meetings"],
                     )
                 except Exception as e:
-                    reply = f"Error: {e}"
+                    # ── PATCH #1: show full details in UI and save to file ──
+                    tb = traceback.format_exc()
+                    st.error("An exception occurred (see details below).")
+                    st.exception(e)               # rich summary
+                    st.code(tb, language="text")  # full stack trace
+                    Path("last_error.log").write_text(tb, encoding="utf-8")
+                    reply = "Error — see traceback above."
+
             ts = datetime.now().strftime("%b-%d-%Y %I:%M%p")
             st.markdown(f"🧾 [{ts}]  \n{reply}")
 
