@@ -1,6 +1,5 @@
 import os
 import pickle
-import math
 from typing import List, Tuple, Dict, Callable, Optional
 from datetime import datetime
 import numpy as np
@@ -8,7 +7,7 @@ import numpy as np
 # FAISS
 try:
     import faiss  # type: ignore
-except Exception as e:
+except Exception:
     faiss = None
 
 # OpenAI embeddings
@@ -46,7 +45,7 @@ def _load_index_and_meta():
         return
 
     if faiss is None:
-        raise RuntimeError("faiss is not installed. Install faiss-cpu in requirements.txt.")
+        raise RuntimeError("faiss is not installed. Add faiss-cpu to requirements.txt.")
 
     if not os.path.exists(FAISS_PATH):
         raise FileNotFoundError(f"FAISS index not found at {FAISS_PATH}")
@@ -56,7 +55,7 @@ def _load_index_and_meta():
     _index = faiss.read_index(FAISS_PATH)
     with open(META_PATH, "rb") as f:
         _meta = pickle.load(f)
-    # Infer dim and metric
+    # Infer metric
     _dim = _index.d if hasattr(_index, "d") else None
     try:
         _ip_index = isinstance(_index, faiss.IndexFlatIP) or _index.metric_type == faiss.METRIC_INNER_PRODUCT
@@ -73,7 +72,6 @@ def _embed(text: str) -> np.ndarray:
     else:
         v = openai.Embedding.create(model=EMBEDDING_MODEL, input=[text])["data"][0]["embedding"]  # type: ignore
     vec = np.array(v, dtype=np.float32)
-    # Normalize for cosine/IP if index is IP
     return vec / (np.linalg.norm(vec) + 1e-12) if _ip_index else vec
 
 # ─────────────────────────────────────────────────────────────
@@ -141,29 +139,24 @@ def rerank(results: List[Tuple[int, float, Dict]],
 
     def score(item, rank0: int):
         _, dist, meta = item
-
-        # Base from returned order (higher is better)
-        base = 1000 - rank0  # simple monotonic tie-breaker
+        base = 1000 - rank0  # stable tie-break
 
         folder = str(meta.get("folder", "")).lower()
-        folder_bonus = 50 if (prefer_meetings and folder == "meetings") else 0  # << gentle
+        folder_bonus = 50 if (prefer_meetings and folder == "meetings") else 0  # gentle
 
-        # Recency bonus (meetings only if date present)
         meet_dt = _parse_iso(meta.get("meeting_date"))
         recency_bonus = 0
         if prefer_recent and meet_dt:
-            # newer → bigger bonus, capped
             days_ago = (now - meet_dt).days
             recency_bonus = max(0, 200 - min(200, days_ago))  # 0..200
 
-        # Validity window for reminders (if present)
         valid_from = _parse_iso(meta.get("valid_from"))
         valid_to = _parse_iso(meta.get("valid_to"))
         validity_bonus = 0
         if valid_from and valid_from > now:
             validity_bonus -= 100
         if valid_to and valid_to < now:
-            validity_bonus -= 200  # expired reminder → downweight
+            validity_bonus -= 200
 
         return base + folder_bonus + recency_bonus + validity_bonus
 
@@ -175,17 +168,12 @@ def rerank(results: List[Tuple[int, float, Dict]],
 # Public APIs
 # ─────────────────────────────────────────────────────────────
 def search(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
-    """
-    General semantic search across all folders (Reminders, Meetings, Finance, etc.).
-    """
+    """General semantic search across all folders (Reminders, Meetings, Finance, etc.)."""
     return _search_core(query, k=k, filter_fn=_default_filter, prefer_meetings=False, prefer_recent=False)
 
 def search_meetings(query: str, k: int = 5) -> List[Tuple[int, float, Dict]]:
-    """
-    Prefer Meetings. Still allows others if caller blends separately.
-    """
+    """Prefer Meetings. Still allows others if caller blends separately."""
     def filt(meta: Dict) -> bool:
-        # We don't *hard* filter here; caller can blend/remix.
         return True
     return _search_core(query, k=k, filter_fn=filt, prefer_meetings=True, prefer_recent=True)
 
@@ -199,4 +187,5 @@ def search_in_date_window(query: str, start: datetime, end: datetime, k: int = 5
         dt = _parse_iso(meta.get("meeting_date"))
         return _in_range(dt, start, end)
     return _search_core(query, k=k, filter_fn=filt, prefer_meetings=True, prefer_recent=True)
+
 
