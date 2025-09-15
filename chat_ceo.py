@@ -1,6 +1,5 @@
 import json
 import re
-import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -16,13 +15,14 @@ from answer_with_rag import answer
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI CEO Assistant 🧠", page_icon="🧠", layout="wide")
 
-# Simple demo login (replace with your auth if needed)
-USERNAME = "admin123"
-PASSWORD = "BestOrg123@#"
+# Credentials from secrets (fallbacks for local dev)
+USERNAME = st.secrets.get("app_user", "admin123")
+PASSWORD = st.secrets.get("app_pass", "BestOrg123@#")
 
 # Paths
 HIST_PATH = Path("chat_history.json")
 REFRESH_PATH = Path("last_refresh.txt")
+HAS_CURATOR = Path("knowledge_curator.py").exists()
 
 # ─────────────────────────────────────────────────────────────
 # Auth
@@ -103,25 +103,102 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
     return str(fp)
 
 # ─────────────────────────────────────────────────────────────
+# History editing helpers
+# ─────────────────────────────────────────────────────────────
+def update_turn(idx: int, new_content: str) -> bool:
+    history = load_history()
+    if idx < 0 or idx >= len(history):
+        return False
+    history[idx]["content"] = new_content
+    history[idx]["edited_at"] = datetime.now().isoformat(timespec="seconds")
+    save_history(history)
+    return True
+
+def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool) -> str:
+    """
+    Rebuild the assistant reply for the chosen user turn.
+    - Uses chat_history up to that user turn (inclusive).
+    - Replaces the next assistant turn if it exists, else inserts a new one.
+    """
+    history = load_history()
+    if idx < 0 or idx >= len(history):
+        raise IndexError("Turn index out of range.")
+    if history[idx].get("role") != "user":
+        raise ValueError("Select a USER turn to regenerate the assistant reply.")
+
+    ctx = history[: idx + 1]
+
+    try:
+        reply = answer(
+            history[idx]["content"],
+            k=7,
+            chat_history=ctx,
+            restrict_to_meetings=limit_meetings,
+            use_rag=use_rag,
+        )
+    except TypeError:
+        # Backward compatibility with older answer() signatures
+        reply = answer(
+            history[idx]["content"],
+            k=7,
+            chat_history=ctx,
+            restrict_to_meetings=limit_meetings,
+        )
+
+    next_assistant = None
+    for j in range(idx + 1, len(history)):
+        if history[j].get("role") == "assistant":
+            next_assistant = j
+            break
+        if history[j].get("role") == "user":
+            break
+
+    ts = datetime.now().strftime("%b-%d-%Y %I:%M%p")
+    if next_assistant is not None:
+        history[next_assistant]["content"] = reply
+        history[next_assistant]["timestamp"] = ts
+        history[next_assistant]["regenerated_from_idx"] = idx
+    else:
+        history.insert(
+            idx + 1,
+            {"role": "assistant", "content": reply, "timestamp": ts, "regenerated_from_idx": idx},
+        )
+
+    save_history(history)
+    return reply
+
+# ─────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────
 st.sidebar.title("🧠 AI CEO Panel")
 st.sidebar.markdown(f"👥 Logged in as: `{USERNAME}`")
 
-# Health report (embedding_report.csv) viewer
 with st.sidebar.expander("📊 Index health (embeddings)"):
     try:
         df = pd.read_csv("embeddings/embedding_report.csv")
         st.caption(f"🧾 Rows: {len(df)}")
-        # Flag sparse rows if columns exist
         if set(["chunks", "chars"]).issubset(df.columns):
             bad = df[(df["chunks"] == 0) | (df["chars"] < 200)]
             if len(bad):
                 st.warning(f"⚠️ {len(bad)} file(s) look sparse (<200 chars or 0 chunks).")
-        # UPDATED: use width instead of deprecated use_container_width
-        st.dataframe(df.tail(50), width="stretch", height=220)
+        st.dataframe(df.tail(50), use_container_width=True, height=220)
     except Exception:
         st.caption("ℹ️ No report yet. Run **Refresh Data**.")
+
+with st.sidebar.expander("🧹 Curate & Restack", expanded=False):
+    if not HAS_CURATOR:
+        st.caption("Add `knowledge_curator.py` to enable curation.")
+    else:
+        if st.button("Run Curator → Rebuild Index"):
+            try:
+                import knowledge_curator  # type: ignore
+                knowledge_curator.main()
+                file_parser.main()
+                embed_and_store.main()
+                save_refresh_time()
+                st.success("Curation + restack complete.")
+            except Exception as e:
+                st.error(f"Failed: {e}")
 
 if st.sidebar.button("🔓 Logout"):
     st.session_state["authenticated"] = False
@@ -129,7 +206,7 @@ if st.sidebar.button("🔓 Logout"):
 
 mode = st.sidebar.radio(
     "🧭 Navigation",
-    ["💬 New Chat", "📜 View History", "🔁 Refresh Data"],
+    ["💬 New Chat", "📜 View History", "✏️ Edit Conversation", "🔁 Refresh Data"],
 )
 st.sidebar.markdown("---")
 st.sidebar.caption("💡 Tip: Start a message with **REMINDER:** to teach the assistant instantly.")
@@ -139,59 +216,25 @@ st.sidebar.caption("💡 Tip: Start a message with **REMINDER:** to teach the as
 # ─────────────────────────────────────────────────────────────
 if mode == "🔁 Refresh Data":
     st.title("🔁 Refresh AI Knowledge Base")
-    st.caption("📥 Parses local reminders + (optional) Google Drive docs, then 🧩 re-embeds.")
-    st.markdown(f"🕒 Last Refreshed: **{load_refresh_time()}**")
+    st.caption("Parses local reminders + (optional) Google Drive docs, then re-embeds.")
+    st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
 
-    # Diagnostics panel (paths, counts, and force rebuild)
-    with st.expander("🧪 Diagnostics"):
-        import os, glob, time
-        base = os.getenv("DATA_DIR", ".")
-        def _fmt(p):
-            try:
-                sz = os.path.getsize(p)
-                mt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(p)))
-                return f"{p}  (size={sz} bytes, mtime={mt})"
-            except Exception:
-                return f"{p}  (missing)"
-
-        st.write("cwd:", os.getcwd())
-        st.write("DATA_DIR:", base)
-        st.write("Embeddings dir exists:", os.path.exists(os.path.join(base, "embeddings")))
-        st.write("Index file:", _fmt(os.path.join(base, "embeddings", "faiss.index")))
-        st.write("Metadata:", _fmt(os.path.join(base, "embeddings", "metadata.pkl")))
-        st.write("Reminders:", len(glob.glob(os.path.join(base, "reminders", "*.txt"))))
-        st.write("Parsed data:", len(glob.glob(os.path.join(base, "parsed_data", "*.txt"))))
-
-        if st.button("🛠️ Force rebuild FAISS"):
-            try:
-                # Optional: wipe existing files to rebuild cleanly
-                for p in [os.path.join(base, "embeddings", "faiss.index"),
-                          os.path.join(base, "embeddings", "metadata.pkl")]:
-                    if os.path.exists(p):
-                        os.remove(p)
-                file_parser.main()
-                embed_and_store.main()
-                st.success("✅ FAISS rebuilt successfully.")
-            except Exception as e:
-                st.exception(e)
-
-    if st.button("🚀 Run File Parser + Embedder"):
-        with st.spinner("⏳ Refreshing knowledge base..."):
+    if st.button("Run File Parser + Embedder"):
+        with st.spinner("Refreshing knowledge base..."):
             try:
                 file_parser.main()       # parses ./reminders into ./parsed_data + (optional) Drive
                 embed_and_store.main()   # re-embeds and writes FAISS + metadata
                 save_refresh_time()
-                st.success("✅ Data refreshed and embedded successfully.")
-                st.markdown(f"🕒 Last Refreshed: **{load_refresh_time()}**")
+                st.success("Data refreshed and embedded successfully.")
+                st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
             except Exception as e:
-                st.exception(e)
-                st.error(f"❌ Failed: {e}")
+                st.error(f"Failed: {e}")
 
 elif mode == "📜 View History":
     st.title("📜 Chat History")
     history = load_history()
     if not history:
-        st.info("ℹ️ No chat history found.")
+        st.info("No chat history found.")
     else:
         for turn in history:
             role = "👤 You" if turn.get("role") == "user" else "🧠 Assistant"
@@ -200,19 +243,72 @@ elif mode == "📜 View History":
 
         st.markdown("---")
         st.download_button(
-            label="⬇️ Download Chat History as CSV",
+            label="Download Chat History as CSV",
             data=export_history_to_csv(history),
             file_name="chat_history.csv",
             mime="text/csv",
         )
-        if st.button("🗑️ Clear Chat History"):
+        if st.button("Clear Chat History"):
             reset_chat()
-            st.success("🧹 History cleared.")
+            st.success("History cleared.")
+
+elif mode == "✏️ Edit Conversation":
+    st.title("✏️ Edit Conversation")
+    history = load_history()
+    if not history:
+        st.info("No chat history found.")
+    else:
+        options = [
+            f"{i}: {turn.get('role','?')} | [{turn.get('timestamp','N/A')}] | {turn.get('content','')[:80].replace('\n',' ')}"
+            for i, turn in enumerate(history)
+        ]
+        sel = st.selectbox("Select a turn to edit", options, index=0)
+        idx = int(sel.split(":", 1)[0])
+        turn = history[idx]
+
+        st.caption(f"Role: {turn.get('role','?')} | Timestamp: {turn.get('timestamp','N/A')}")
+        edited = st.text_area("Content", value=turn.get("content", ""), height=220)
+
+        col1, col2, col3 = st.columns([1, 1, 1])
+
+        with col1:
+            if st.button("Save changes"):
+                if update_turn(idx, edited):
+                    st.success("Saved.")
+                else:
+                    st.error("Failed to save changes.")
+
+        with col2:
+            if turn.get("role") == "user":
+                if st.button("Regenerate assistant reply from here"):
+                    try:
+                        reply = regenerate_reply_for_user_turn(
+                            idx,
+                            limit_meetings=st.session_state.get("limit_meetings", False),
+                            use_rag=st.session_state.get("use_rag", True),
+                        )
+                        st.info("Assistant reply regenerated (updated history).")
+                        st.markdown(reply)
+                    except Exception as e:
+                        st.error(f"Failed to regenerate: {e}")
+            else:
+                st.caption("Regeneration is available only for USER turns.")
+
+        with col3:
+            if turn.get("role") == "user":
+                if st.button("Convert this turn to a REMINDER file"):
+                    path = save_reminder_local(
+                        edited,
+                        title_hint=(edited.strip().split("\n", 1)[0][:60] if edited.strip() else "Reminder"),
+                    )
+                    st.success(f"Saved reminder: {path}. Use 'Refresh Data' to index it.")
+            else:
+                st.caption("Only USER turns can be converted to a REMINDER.")
 
 elif mode == "💬 New Chat":
     st.title("🧠 AI CEO Assistant")
-    st.caption("📎 Ask about meetings, projects, policies. Start a message with **REMINDER:** to teach facts.")
-    st.markdown(f"🕒 Last Refreshed: **{load_refresh_time()}**")
+    st.caption("Ask about meetings, projects, policies. Start a message with REMINDER: to teach facts.")
+    st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
 
     # Persisted defaults for toggles (Meetings OFF, RAG ON)
     if "limit_meetings" not in st.session_state:
@@ -223,13 +319,13 @@ elif mode == "💬 New Chat":
     colA, colB = st.columns([1, 1])
     with colA:
         limit_meetings = st.checkbox(
-            "🗂️ Limit retrieval to Meetings",
+            "Limit retrieval to Meetings",
             value=st.session_state["limit_meetings"],
             key="limit_meetings",
         )
     with colB:
         use_rag = st.checkbox(
-            "📚 Use internal knowledge (RAG)",
+            "Use internal knowledge (RAG)",
             value=st.session_state["use_rag"],
             key="use_rag",
         )
@@ -238,24 +334,24 @@ elif mode == "💬 New Chat":
     history = load_history()
     for turn in history:
         with st.chat_message(turn.get("role", "assistant")):
-            st.markdown(f"🗨️ [{turn.get('timestamp', 'N/A')}]  \n{turn.get('content', '')}")
+            st.markdown(f"[{turn.get('timestamp', 'N/A')}]  \n{turn.get('content', '')}")
 
     # Chat input
-    user_msg = st.chat_input("✍️ Type your question or add a REMINDER…")
+    user_msg = st.chat_input("Type your question or add a REMINDER…")
     if user_msg:
         # 1) If this is a REMINDER, save it immediately to ./reminders
         if user_msg.strip().lower().startswith("reminder:"):
             body = re.sub(r"^reminder:\s*", "", user_msg.strip(), flags=re.I)
             title_hint = body.split("\n", 1)[0][:60]
             saved_path = save_reminder_local(body, title_hint=title_hint)
-            st.success(f"💾 Reminder saved: `{saved_path}`. Run **🔁 Refresh Data** to index it.")
+            st.success(f"Reminder saved: `{saved_path}`. Run Refresh Data to index it.")
 
         # 2) Normal chat flow
         now = datetime.now().strftime("%b-%d-%Y %I:%M%p")
         history.append({"role": "user", "content": user_msg, "timestamp": now})
 
         with st.chat_message("assistant"):
-            with st.spinner("🤔 Thinking…"):
+            with st.spinner("Processing…"):
                 try:
                     reply = answer(
                         user_msg,
@@ -265,7 +361,6 @@ elif mode == "💬 New Chat":
                         use_rag=st.session_state["use_rag"],
                     )
                 except TypeError:
-                    # Backward compatible with older answer() signature
                     reply = answer(
                         user_msg,
                         k=7,
@@ -273,16 +368,10 @@ elif mode == "💬 New Chat":
                         restrict_to_meetings=st.session_state["limit_meetings"],
                     )
                 except Exception as e:
-                    # ── PATCH #1: show full details in UI and save to file ──
-                    tb = traceback.format_exc()
-                    st.error("An exception occurred (see details below).")
-                    st.exception(e)               # rich summary
-                    st.code(tb, language="text")  # full stack trace
-                    Path("last_error.log").write_text(tb, encoding="utf-8")
-                    reply = "Error — see traceback above."
-
+                    reply = f"Error: {e}"
             ts = datetime.now().strftime("%b-%d-%Y %I:%M%p")
-            st.markdown(f"🧾 [{ts}]  \n{reply}")
+            st.markdown(f"[{ts}]  \n{reply}")
 
         history.append({"role": "assistant", "content": reply, "timestamp": ts})
         save_history(history)
+
