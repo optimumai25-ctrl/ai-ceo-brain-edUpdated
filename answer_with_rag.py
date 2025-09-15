@@ -25,29 +25,12 @@ COMPLETIONS_MODEL = "gpt-5"
 MAX_CONTEXT_CHARS = 8000
 
 # ─────────────────────────────────────────────────────────────
-# Helpers
+# Context Builder
 # ─────────────────────────────────────────────────────────────
-def _merge_dedup(a: List[Tuple[int, float, Dict]],
-                 b: List[Tuple[int, float, Dict]],
-                 limit: int) -> List[Tuple[int, float, Dict]]:
-    """
-    Stable merge by vector id, keep order, cap to limit.
-    Ensures date-window results (Meetings) and general results (Reminders/others) are blended.
-    """
-    seen, out = set(), []
-    for lst in (a, b):
-        for rid, dist, meta in lst:
-            if rid in seen:
-                continue
-            out.append((rid, dist, meta))
-            seen.add(rid)
-            if len(out) >= limit:
-                return out
-    return out[:limit]
-
 def build_context(topk: List[Tuple[int, float, Dict]]) -> str:
     """
-    Compact context: [SOURCE: filename | CHUNK: id] + snippet.
+    Create a compact context: [SOURCE: filename | CHUNK: id]
+    Then snippet text, respecting MAX_CONTEXT_CHARS.
     """
     parts, total = [], 0
     for _, _, meta in topk:
@@ -62,12 +45,13 @@ def build_context(topk: List[Tuple[int, float, Dict]]) -> str:
     return "\n".join(parts)
 
 # ─────────────────────────────────────────────────────────────
-# Date-window resolution (supports “this week/quarter”, “Q3 2025”, etc.)
+# Date-window resolution from user query (extended)
 # ─────────────────────────────────────────────────────────────
 _MONTHS = "(january|february|march|april|may|june|july|august|september|october|november|december)"
-_Q_PAT = re.compile(r"\bq([1-4])\s*(?:[-/ ]?\s*)?(20\d{2})\b", re.I)
+_Q_PAT = re.compile(r"\bq([1-4])\s*(?:[-/ ]?\s*)?(20\d{2})\b", re.I)  # Q1 2025 / Q3-2025 / Q4/2026
 
 def _quarter_bounds(q: int, year: int):
+    # Q1: Jan–Mar; Q2: Apr–Jun; Q3: Jul–Sep; Q4: Oct–Dec
     starts = {1: (1, 1), 2: (4, 1), 3: (7, 1), 4: (10, 1)}
     sm, sd = starts[q]
     if q < 4:
@@ -84,7 +68,7 @@ def _quarter_bounds(q: int, year: int):
 def resolve_date_window_from_query(q: str):
     """
     Recognize:
-      - 'this week', 'last week'  (Mon..Sun; 'this week' ends at now)
+      - 'this week', 'last week'  (weeks are Mon..Sun; 'this week' ends at now)
       - 'this month', 'last month'
       - 'this quarter'
       - 'Q1 2025', 'Q3-2025', 'Q4/2026'
@@ -95,42 +79,55 @@ def resolve_date_window_from_query(q: str):
     s = q.lower().strip()
     today = datetime.now()
 
+    # week windows
     if "this week" in s:
         monday = today - timedelta(days=today.weekday())
-        return (monday.replace(hour=0, minute=0, second=0, microsecond=0),
-                today.replace(hour=23, minute=59, second=59, microsecond=0))
+        return (
+            monday.replace(hour=0, minute=0, second=0, microsecond=0),
+            today.replace(hour=23, minute=59, second=59, microsecond=0),
+        )
 
     if "last week" in s:
-        weekday = today.weekday()
+        weekday = today.weekday()  # Mon=0
         last_sun = today - timedelta(days=weekday + 1)
         last_mon = last_sun - timedelta(days=6)
-        return (last_mon.replace(hour=0, minute=0, second=0, microsecond=0),
-                last_sun.replace(hour=23, minute=59, second=59, microsecond=0))
+        return (
+            last_mon.replace(hour=0, minute=0, second=0, microsecond=0),
+            last_sun.replace(hour=23, minute=59, second=59, microsecond=0),
+        )
 
+    # month windows
     if "this month" in s:
         first = today.replace(day=1)
-        return (first.replace(hour=0, minute=0, second=0, microsecond=0),
-                today.replace(hour=23, minute=59, second=59, microsecond=0))
+        return (
+            first.replace(hour=0, minute=0, second=0, microsecond=0),
+            today.replace(hour=23, minute=59, second=59, microsecond=0),
+        )
 
     if "last month" in s:
         first_this = today.replace(day=1)
         last_prev = first_this - timedelta(days=1)
         first_prev = last_prev.replace(day=1)
-        return (first_prev.replace(hour=0, minute=0, second=0, microsecond=0),
-                last_prev.replace(hour=23, minute=59, second=59, microsecond=0))
+        return (
+            first_prev.replace(hour=0, minute=0, second=0, microsecond=0),
+            last_prev.replace(hour=23, minute=59, second=59, microsecond=0),
+        )
 
+    # quarter windows
     if "this quarter" in s:
         m = today.month
         qn = 1 if m <= 3 else 2 if m <= 6 else 3 if m <= 9 else 4
         start, end = _quarter_bounds(qn, today.year)
-        end = min(end, today.replace(hour=23, minute=59, second=59, microsecond=0))
+        end = min(end, today.replace(hour=23, minute=59, second=59, microsecond=0))  # don't go into future
         return (start, end)
 
     qm = _Q_PAT.search(s)
     if qm:
-        qn = int(qm.group(1)); year = int(qm.group(2))
+        qn = int(qm.group(1))
+        year = int(qm.group(2))
         return _quarter_bounds(qn, year)
 
+    # specific ISO date
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         y, mo, d = map(int, m.groups())
@@ -138,21 +135,25 @@ def resolve_date_window_from_query(q: str):
         end = datetime(y, mo, d, 23, 59, 59)
         return (start, end)
 
+    # textual date like "September 2, 2025"
     m2 = re.search(rf"{_MONTHS}\s+(\d{{1,2}}),\s*(\d{{4}})", s, re.I)
     if m2:
         month_name, dd, yy = m2.groups()
         dt = datetime.strptime(f"{month_name} {dd} {yy}", "%B %d %Y")
-        return (dt.replace(hour=0, minute=0, second=0, microsecond=0),
-                dt.replace(hour=23, minute=59, second=59, microsecond=0))
+        start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = dt.replace(hour=23, minute=59, second=59, microsecond=0)
+        return (start, end)
+
     return None
 
 # ─────────────────────────────────────────────────────────────
-# Generative intent bypass
+# Generative intent bypass (act like regular GPT)
 # ─────────────────────────────────────────────────────────────
 _GEN_PAT = re.compile(
     r"\b(idea|ideas|brainstorm|suggest|suggestions|plan|plans|strategy|strategies|framework|outline|"
     r"write|draft|improve|optimi[sz]e|approach|roadmap|design|architecture|concept|"
-    r"marketing campaign|growth experiment)\b", re.I,
+    r"marketing campaign|growth experiment)\b",
+    re.I,
 )
 def is_generative(q: str) -> bool:
     return bool(_GEN_PAT.search(q))
@@ -160,34 +161,57 @@ def is_generative(q: str) -> bool:
 # ─────────────────────────────────────────────────────────────
 # Chat Completion (no temperature for GPT-5)
 # ─────────────────────────────────────────────────────────────
-def ask_gpt(query: str, context: str = "", chat_history: List[Dict] = [], structure: str = "none") -> str:
+def ask_gpt(
+    query: str,
+    context: str = "",
+    chat_history: List[Dict] = [],
+    structure: str = "none",
+) -> str:
     system = (
         "You are a precise Virtual CEO assistant. "
         "When sources are provided, use them and cite [filename#chunk] like [2025-09-02_Meeting-Summary.txt#2]. "
         "When no sources are provided, answer with your general knowledge clearly and concisely."
     )
+
+    # Optional structure for meeting summaries
     if structure == "meeting_summary":
-        system += ("\nFormat the answer with these exact H2 sections in order: "
-                   "## Agenda\n## Decisions\n## Action Items\n"
-                   "Under Action Items, list bullets as: '- Task — Owner — Due Date' if present.")
+        system += (
+            "\nFormat the answer with these exact H2 sections in order: "
+            "## Agenda\n## Decisions\n## Action Items\n"
+            "Under Action Items, list bullets as: '- Task — Owner — Due Date' if present."
+        )
 
     messages: List[Dict] = [{"role": "system", "content": system}]
+
+    # Include up to last 4 chat history turns
     for msg in chat_history[-4:]:
-        content = msg.get("content", ""); ts = msg.get("timestamp", ""); role = msg.get("role", "user")
-        messages.append({"role": role, "content": (f"[{ts}] {content}" if ts else content)})
+        content = msg.get("content", "")
+        timestamp = msg.get("timestamp", "")
+        role = msg.get("role", "user")
+        formatted = f"[{timestamp}] {content}" if timestamp else content
+        messages.append({"role": role, "content": formatted})
 
-    messages.append({"role": "user", "content": f"Query:\n{query}\n\nSources:\n{context}"} if context
-                    else {"role": "user", "content": query})
+    if context:
+        messages.append({"role": "user", "content": f"Query:\n{query}\n\nSources:\n{context}"})
+    else:
+        messages.append({"role": "user", "content": query})
 
+    # IMPORTANT: no temperature passed for GPT-5
     if _use_client:
-        resp = _client.chat.completions.create(model=COMPLETIONS_MODEL, messages=messages[-6:])  # type: ignore
+        resp = _client.chat.completions.create(  # type: ignore
+            model=COMPLETIONS_MODEL,
+            messages=messages[-6:],
+        )
         return resp.choices[0].message.content
     else:
-        resp = openai.ChatCompletion.create(model=COMPLETIONS_MODEL, messages=messages[-6:])  # type: ignore
+        resp = openai.ChatCompletion.create(  # type: ignore
+            model=COMPLETIONS_MODEL,
+            messages=messages[-6:],
+        )
         return resp.choices[0].message["content"]
 
 # ─────────────────────────────────────────────────────────────
-# Public API — BLENDED retrieval (Meetings + Reminders)
+# Public API (with strong fallbacks A & B)
 # ─────────────────────────────────────────────────────────────
 def answer(
     query: str,
@@ -197,40 +221,62 @@ def answer(
     use_rag: bool = True,
 ) -> str:
     """
-    - Date windows blend: top date-window (Meetings) + top general (Reminders/others).
-    - Meetings toggle acts as a *boost*, not a hard filter.
-    - Still bypasses retrieval for generative asks or when use_rag=False.
+    - Detects relative/specific dates and restricts retrieval to that window when found.
+    - Skips retrieval entirely for generative asks or when use_rag=False.
+    - Structures meeting digests when appropriate (Agenda / Decisions / Action Items).
+    - Fallbacks:
+        A) If restrict_to_meetings=True but we got no meeting hits, fall back to general search.
+        B) If a date window is requested but returns no hits, fall back to general search (no window).
     """
+    # Generative bypass or explicit GPT-only mode
     if not use_rag or is_generative(query):
         return ask_gpt(query, context="", chat_history=chat_history, structure="none")
 
-    def _is_meeting(meta: Dict) -> bool:
-        return (meta.get("folder", "") or "").lower() == "meetings"
+    def _has_meeting_hits(hs):
+        for _, _, meta in hs or []:
+            if (meta.get("folder", "") or "").lower() == "meetings":
+                return True
+        return False
 
-    # 1) If query has a date-window → BLEND
+    hits = []
+
+    # 1) Date-scoped search if query contains a window
     win = resolve_date_window_from_query(query)
     if win:
         start, end = win
-        date_hits = search_in_date_window(query, start, end, k=max(k, 5))  # meetings w/ dates
-        gen_hits  = search(query, k=max(k, 5))                              # reminders + everything
-        hits = _merge_dedup(date_hits, gen_hits, limit=k)
-    else:
-        # 2) No window → prefer Meetings if toggle ON, but BLEND with general
-        if restrict_to_meetings:
-            meet_hits = search_meetings(query, k=max(k, 5))
-            gen_hits  = search(query, k=max(k, 10))
-            hits = _merge_dedup(meet_hits, gen_hits, limit=k)
-        else:
+        hits = search_in_date_window(query, start, end, k=k)
+
+        # Fallback B: date window yielded nothing → try general search (no window)
+        if not hits:
             hits = search(query, k=k)
 
+        # Fallback A (in date path): forced meetings but no meeting hits → try general search
+        if restrict_to_meetings and not _has_meeting_hits(hits):
+            alt = search(query, k=k)
+            if alt:
+                hits = alt
+    else:
+        # 2) No date window → prefer meetings only if user asked
+        hits = search_meetings(query, k=k) if restrict_to_meetings else search(query, k=k)
+
+        # Fallback A (no date path): meetings requested but not actually meeting hits
+        if restrict_to_meetings and not _has_meeting_hits(hits):
+            alt = search(query, k=k)
+            if alt:
+                hits = alt
+
+    # If nothing usable, answer without sources
     if not hits:
         return ask_gpt(query, context="", chat_history=chat_history, structure="none")
 
+    # Build context and choose structure
     ctx = build_context(hits)
-    is_meeting_ctx = any(_is_meeting(meta) for _, _, meta in hits)
+    is_meeting_ctx = any((meta.get("folder", "").lower() == "meetings") for _, _, meta in hits)
     wants_summary = bool(re.search(r"\b(summary|summarize|decisions?|action items?)\b", query, re.I))
     structure = "meeting_summary" if (is_meeting_ctx and (restrict_to_meetings or wants_summary)) else "none"
+
     return ask_gpt(query, context=ctx, chat_history=chat_history, structure=structure)
 
+# Optional CLI test
 if __name__ == "__main__":
     print(answer("Who is our AI Coordinator this week?", k=7, restrict_to_meetings=True))
