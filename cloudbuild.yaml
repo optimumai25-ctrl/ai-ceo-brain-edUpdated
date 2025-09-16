@@ -1,0 +1,24 @@
+substitutions:
+  _LOCATION: "asia-south1"
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build','-t','${_LOCATION}-docker.pkg.dev/$PROJECT_ID/ai-repo/ai-ceo:$SHORT_SHA','."]
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push','${_LOCATION}-docker.pkg.dev/$PROJECT_ID/ai-repo/ai-ceo:$SHORT_SHA']
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+    - -c
+    - >
+      gcloud run deploy ai-ceo-api
+      --region=${_LOCATION}
+      --image ${_LOCATION}-docker.pkg.dev/$PROJECT_ID/ai-repo/ai-ceo:$SHORT_SHA
+      --service-account ai-ceo-sa@$PROJECT_ID.iam.gserviceaccount.com
+      --allow-unauthenticated
+      --cpu=2 --memory=2Gi --concurrency=10 --timeout=900s
+      --set-env-vars DATA_DIR=/data
+      --set-secrets OPENAI_API_KEY=OPENAI_API_KEY:latest
+      --add-volume name=datavol,type=cloud-storage,bucket=$PROJECT_ID-ai-ceo-data
+      --add-volume-mount volume=datavol,mount-path=/data
+images:
+- '${_LOCATION}-docker.pkg.dev/$PROJECT_ID/ai-repo/ai-ceo:$SHORT_SHA'
