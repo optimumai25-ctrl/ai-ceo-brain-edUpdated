@@ -97,3 +97,4 @@ def upload_or_update_file(service, file_path, folder_id):
             supportsAllDrives=True
         ).execute()
         print(f"✅ Uploaded: {file_name}")
+
