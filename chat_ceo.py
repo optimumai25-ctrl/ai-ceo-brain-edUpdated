@@ -10,9 +10,6 @@ import file_parser
 import embed_and_store
 from answer_with_rag import answer
 
-# NEW: Drive uploader (My Drive by default; Shared Drive if secrets include shared_drive_id)
-from gdrive_uploader import upload_csv_to_path
-
 # ─────────────────────────────────────────────────────────────
 # App Config
 # ─────────────────────────────────────────────────────────────
@@ -105,23 +102,6 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
     fp.write_text(payload, encoding="utf-8")
     return str(fp)
 
-# NEW: persist history locally as CSV and upload to Drive
-def persist_history_to_csv_and_drive(history: list):
-    try:
-        # Write CSV locally
-        df = pd.DataFrame(history)
-        csv_path = Path("chat_history.csv")
-        df.to_csv(csv_path, index=False, encoding="utf-8")
-
-        # Upload or update in Drive at AI_CEO_KnowledgeBase/Chat_History
-        upload_csv_to_path(str(csv_path), "AI_CEO_KnowledgeBase", "Chat_History")
-
-        # Optional small status in UI (non-blocking)
-        st.toast("Chat history synced to Drive.", icon="✅")
-    except Exception as e:
-        # Don't break the chat flow if Drive isn't configured
-        st.warning(f"Could not sync chat history to Drive: {e}")
-
 # ─────────────────────────────────────────────────────────────
 # History editing helpers
 # ─────────────────────────────────────────────────────────────
@@ -132,9 +112,6 @@ def update_turn(idx: int, new_content: str) -> bool:
     history[idx]["content"] = new_content
     history[idx]["edited_at"] = datetime.now().isoformat(timespec="seconds")
     save_history(history)
-
-    # NEW: keep Drive copy up to date after edits
-    persist_history_to_csv_and_drive(history)
     return True
 
 def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool) -> str:
@@ -188,9 +165,6 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
         )
 
     save_history(history)
-
-    # NEW: keep Drive copy up to date after regeneration
-    persist_history_to_csv_and_drive(history)
     return reply
 
 # ─────────────────────────────────────────────────────────────
@@ -400,6 +374,3 @@ elif mode == "💬 New Chat":
 
         history.append({"role": "assistant", "content": reply, "timestamp": ts})
         save_history(history)
-
-        # NEW: automatically export CSV locally and upload/update to Drive
-        persist_history_to_csv_and_drive(history)
