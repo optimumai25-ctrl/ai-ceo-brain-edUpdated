@@ -1,0 +1,17 @@
+streamlit>=1.36
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2.6
+python-dotenv>=1.0
+openai>=1.40
+faiss-cpu>=1.8
+numpy>=1.26
+pandas>=2.2
+PyPDF2>=3.0
+PyMuPDF>=1.24
+python-docx>=1.1
+tqdm>=4.66
+google-api-python-client>=2.134.0
+google-auth>=2.31
+google-auth-httplib2>=0.2
+google-auth-oauthlib>=1.2
