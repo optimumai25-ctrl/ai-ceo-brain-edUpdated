@@ -1,0 +1,15 @@
+# Keep Cloud Build contexts small
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+.env
+*.log
+.embeddings_cache/
+.parsed_cache/
+reminders/
+parsed_data/
+embeddings/
+chat_history.json
+last_refresh.txt
+.streamlit/
