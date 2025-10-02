@@ -1,3 +1,4 @@
+import os
 import json
 import re
 from pathlib import Path
@@ -10,19 +11,46 @@ import file_parser
 import embed_and_store
 from answer_with_rag import answer
 
+
 # ─────────────────────────────────────────────────────────────
 # App Config
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI CEO Assistant 🧠", page_icon="🧠", layout="wide")
 
-# Credentials from secrets (fallbacks for local dev)
-USERNAME = st.secrets.get("app_user", "admin123")
-PASSWORD = st.secrets.get("app_pass", "BestOrg123@#")
+
+# ─────────────────────────────────────────────────────────────
+# Secrets / Env handling
+# ─────────────────────────────────────────────────────────────
+def get_secret(key: str, default=None):
+    """
+    Prefer environment variables in production (e.g., Render),
+    fall back to Streamlit secrets locally, supporting both
+    "APP_USER" and "app_user" styles.
+    """
+    val = os.getenv(key)
+    if val is not None:
+        return val
+    try:
+        return st.secrets.get(key.lower(), default)
+    except Exception:
+        return default
+
+
+# Credentials (Render: set APP_USER/APP_PASS; Local: secrets.toml)
+USERNAME = get_secret("APP_USER", "admin123")
+PASSWORD = get_secret("APP_PASS", "BestOrg123@#")
+
+# Optional: ensure OPENAI_API_KEY available as env for downstream libs
+_openai = get_secret("OPENAI_API_KEY")
+if _openai and not os.getenv("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = _openai
+
 
 # Paths
 HIST_PATH = Path("chat_history.json")
 REFRESH_PATH = Path("last_refresh.txt")
 HAS_CURATOR = Path("knowledge_curator.py").exists()
+
 
 # ─────────────────────────────────────────────────────────────
 # Auth
@@ -41,11 +69,13 @@ def login():
             else:
                 st.error("❌ Invalid username or password.")
 
+
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 if not st.session_state["authenticated"]:
     login()
     st.stop()
+
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -55,30 +85,32 @@ def load_history():
         return json.loads(HIST_PATH.read_text(encoding="utf-8"))
     return []
 
+
 def save_history(history):
     HIST_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def reset_chat():
     if HIST_PATH.exists():
         HIST_PATH.unlink()
 
+
 def save_refresh_time():
     REFRESH_PATH.write_text(datetime.now().strftime("%b-%d-%Y %I:%M %p"))
+
 
 def load_refresh_time():
     if REFRESH_PATH.exists():
         return REFRESH_PATH.read_text()
     return "Never"
 
+
 def export_history_to_csv(history: list) -> bytes:
     df = pd.DataFrame(history)
     return df.to_csv(index=False).encode("utf-8")
 
+
 def save_reminder_local(content: str, title_hint: str = "") -> str:
-    """
-    Save a REMINDER as a structured .txt in ./reminders and return the file path.
-    Accepts either a plain sentence or a structured block with Title/Tags/ValidFrom/Body.
-    """
     reminders_dir = Path("reminders")
     reminders_dir.mkdir(exist_ok=True)
 
@@ -102,6 +134,7 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
     fp.write_text(payload, encoding="utf-8")
     return str(fp)
 
+
 # ─────────────────────────────────────────────────────────────
 # History editing helpers
 # ─────────────────────────────────────────────────────────────
@@ -114,12 +147,8 @@ def update_turn(idx: int, new_content: str) -> bool:
     save_history(history)
     return True
 
+
 def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool) -> str:
-    """
-    Rebuild the assistant reply for the chosen user turn.
-    - Uses chat_history up to that user turn (inclusive).
-    - Replaces the next assistant turn if it exists, else inserts a new one.
-    """
     history = load_history()
     if idx < 0 or idx >= len(history):
         raise IndexError("Turn index out of range.")
@@ -137,7 +166,6 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
             use_rag=use_rag,
         )
     except TypeError:
-        # Backward compatibility with older answer() signatures
         reply = answer(
             history[idx]["content"],
             k=7,
@@ -166,6 +194,7 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
 
     save_history(history)
     return reply
+
 
 # ─────────────────────────────────────────────────────────────
 # Sidebar
@@ -211,6 +240,7 @@ mode = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.caption("💡 Tip: Start a message with **REMINDER:** to teach the assistant instantly.")
 
+
 # ─────────────────────────────────────────────────────────────
 # Modes
 # ─────────────────────────────────────────────────────────────
@@ -222,8 +252,8 @@ if mode == "🔁 Refresh Data":
     if st.button("Run File Parser + Embedder"):
         with st.spinner("Refreshing knowledge base..."):
             try:
-                file_parser.main()       # parses ./reminders into ./parsed_data + (optional) Drive
-                embed_and_store.main()   # re-embeds and writes FAISS + metadata
+                file_parser.main()
+                embed_and_store.main()
                 save_refresh_time()
                 st.success("Data refreshed and embedded successfully.")
                 st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
@@ -310,7 +340,6 @@ elif mode == "💬 New Chat":
     st.caption("Ask about meetings, projects, policies. Start a message with REMINDER: to teach facts.")
     st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
 
-    # Persisted defaults for toggles (Meetings OFF, RAG ON)
     if "limit_meetings" not in st.session_state:
         st.session_state["limit_meetings"] = False
     if "use_rag" not in st.session_state:
@@ -330,23 +359,19 @@ elif mode == "💬 New Chat":
             key="use_rag",
         )
 
-    # Show prior turns
     history = load_history()
     for turn in history:
         with st.chat_message(turn.get("role", "assistant")):
             st.markdown(f"[{turn.get('timestamp', 'N/A')}]  \n{turn.get('content', '')}")
 
-    # Chat input
     user_msg = st.chat_input("Type your question or add a REMINDER…")
     if user_msg:
-        # 1) If this is a REMINDER, save it immediately to ./reminders
         if user_msg.strip().lower().startswith("reminder:"):
             body = re.sub(r"^reminder:\s*", "", user_msg.strip(), flags=re.I)
             title_hint = body.split("\n", 1)[0][:60]
             saved_path = save_reminder_local(body, title_hint=title_hint)
             st.success(f"Reminder saved: `{saved_path}`. Run Refresh Data to index it.")
 
-        # 2) Normal chat flow
         now = datetime.now().strftime("%b-%d-%Y %I:%M%p")
         history.append({"role": "user", "content": user_msg, "timestamp": now})
 
