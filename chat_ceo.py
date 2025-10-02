@@ -1,3 +1,4 @@
+import os
 import json
 import re
 from pathlib import Path
@@ -15,13 +16,86 @@ from answer_with_rag import answer
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI CEO Assistant 🧠", page_icon="🧠", layout="wide")
 
-# Credentials from secrets (fallbacks for local dev)
-USERNAME = st.secrets.get("app_user", "admin123")
-PASSWORD = st.secrets.get("app_pass", "BestOrg123@#")
+# ─────────────────────────────────────────────────────────────
+# Helpers: robust secrets/env access
+# ─────────────────────────────────────────────────────────────
+def _get_from_st_secrets(key, default=None):
+    """Safely read from st.secrets without crashing if secrets.toml is missing."""
+    try:
+        # Accessing st.secrets may raise StreamlitSecretNotFoundError if no file is present
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
 
-# Paths
-HIST_PATH = Path("chat_history.json")
-REFRESH_PATH = Path("last_refresh.txt")
+def get_cred(key, default=None):
+    """Environment-first; fallback to st.secrets; then to default."""
+    val = os.getenv(key)
+    if val is not None and val != "":
+        return val
+    return _get_from_st_secrets(key.lower(), default)  # allow 'app_user' style locally
+
+def load_gdrive_service_account():
+    """
+    Construct a Google service account JSON dict from environment variables,
+    with a fallback to st.secrets['gdrive'] for local development.
+    Expected env vars (you already created these in Railway):
+      GDRIVE_TYPE, GDRIVE_PROJECT_ID, GDRIVE_PRIVATE_KEY_ID, GDRIVE_PRIVATE_KEY,
+      GDRIVE_CLIENT_EMAIL, GDRIVE_CLIENT_ID, GDRIVE_AUTH_URI, GDRIVE_TOKEN_URI,
+      GDRIVE_AUTH_PROVIDER_X509_CERT_URL, GDRIVE_CLIENT_X509_CERT_URL, GDRIVE_UNIVERSE_DOMAIN
+    """
+    # If a single JSON blob was provided (optional), prefer it:
+    blob = os.getenv("GDRIVE_SA_JSON")
+    if blob:
+        try:
+            return json.loads(blob)
+        except json.JSONDecodeError:
+            pass  # fall through to field-by-field assembly
+
+    # Assemble from individual fields
+    pk = os.getenv("GDRIVE_PRIVATE_KEY", "")
+    # Allow either real newlines or \n-escaped value
+    pk = pk.replace("\\n", "\n")
+
+    assembled = {
+        "type": os.getenv("GDRIVE_TYPE") or _get_from_st_secrets("gdrive", {}).get("type"),
+        "project_id": os.getenv("GDRIVE_PROJECT_ID") or _get_from_st_secrets("gdrive", {}).get("project_id"),
+        "private_key_id": os.getenv("GDRIVE_PRIVATE_KEY_ID") or _get_from_st_secrets("gdrive", {}).get("private_key_id"),
+        "private_key": pk or _get_from_st_secrets("gdrive", {}).get("private_key"),
+        "client_email": os.getenv("GDRIVE_CLIENT_EMAIL") or _get_from_st_secrets("gdrive", {}).get("client_email"),
+        "client_id": os.getenv("GDRIVE_CLIENT_ID") or _get_from_st_secrets("gdrive", {}).get("client_id"),
+        "auth_uri": os.getenv("GDRIVE_AUTH_URI") or _get_from_st_secrets("gdrive", {}).get("auth_uri"),
+        "token_uri": os.getenv("GDRIVE_TOKEN_URI") or _get_from_st_secrets("gdrive", {}).get("token_uri"),
+        "auth_provider_x509_cert_url": os.getenv("GDRIVE_AUTH_PROVIDER_X509_CERT_URL") or _get_from_st_secrets("gdrive", {}).get("auth_provider_x509_cert_url"),
+        "client_x509_cert_url": os.getenv("GDRIVE_CLIENT_X509_CERT_URL") or _get_from_st_secrets("gdrive", {}).get("client_x509_cert_url"),
+        "universe_domain": os.getenv("GDRIVE_UNIVERSE_DOMAIN") or _get_from_st_secrets("gdrive", {}).get("universe_domain"),
+    }
+
+    # If even 'type' and 'client_email' are empty, treat as unavailable
+    if not assembled["type"] and not assembled["client_email"]:
+        return None
+    return assembled
+
+# ─────────────────────────────────────────────────────────────
+# Credentials (ENV → secrets → default)
+# ─────────────────────────────────────────────────────────────
+USERNAME = get_cred("APP_USER", "admin123")
+PASSWORD = get_cred("APP_PASS", "BestOrg123@#")
+
+# Make the service account JSON available if needed elsewhere
+GDRIVE_SA = load_gdrive_service_account()
+
+# ─────────────────────────────────────────────────────────────
+# Paths (honor DATA_DIR for Railway/Docker volumes)
+# ─────────────────────────────────────────────────────────────
+BASE_DIR = Path(os.getenv("DATA_DIR", "."))
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+HIST_PATH = BASE_DIR / "chat_history.json"
+REFRESH_PATH = BASE_DIR / "last_refresh.txt"
+REMINDERS_DIR = BASE_DIR / "reminders"
+EMBED_DIR = BASE_DIR / "embeddings"
+PARSED_DIR = BASE_DIR / "parsed_data"
+
 HAS_CURATOR = Path("knowledge_curator.py").exists()
 
 # ─────────────────────────────────────────────────────────────
@@ -76,17 +150,16 @@ def export_history_to_csv(history: list) -> bytes:
 
 def save_reminder_local(content: str, title_hint: str = "") -> str:
     """
-    Save a REMINDER as a structured .txt in ./reminders and return the file path.
+    Save a REMINDER as a structured .txt in DATA_DIR/reminders and return the file path.
     Accepts either a plain sentence or a structured block with Title/Tags/ValidFrom/Body.
     """
-    reminders_dir = Path("reminders")
-    reminders_dir.mkdir(exist_ok=True)
+    REMINDERS_DIR.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M")
     title = (title_hint or content.strip().split("\n", 1)[0][:60] or "Untitled").strip()
     safe_title = re.sub(r"[^A-Za-z0-9_\-]+", "_", title) or "Untitled"
 
-    fp = reminders_dir / f"{ts}_{safe_title}.txt"
+    fp = REMINDERS_DIR / f"{ts}_{safe_title}.txt"
 
     is_structured = bool(re.search(r"(?mi)^\s*Title:|^\s*Tags:|^\s*ValidFrom:|^\s*Body:", content))
     if is_structured:
@@ -137,7 +210,6 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
             use_rag=use_rag,
         )
     except TypeError:
-        # Backward compatibility with older answer() signatures
         reply = answer(
             history[idx]["content"],
             k=7,
@@ -175,7 +247,8 @@ st.sidebar.markdown(f"👥 Logged in as: `{USERNAME}`")
 
 with st.sidebar.expander("📊 Index health (embeddings)"):
     try:
-        df = pd.read_csv("embeddings/embedding_report.csv")
+        report_path = EMBED_DIR / "embedding_report.csv"
+        df = pd.read_csv(report_path)
         st.caption(f"🧾 Rows: {len(df)}")
         if set(["chunks", "chars"]).issubset(df.columns):
             bad = df[(df["chunks"] == 0) | (df["chars"] < 200)]
@@ -222,8 +295,9 @@ if mode == "🔁 Refresh Data":
     if st.button("Run File Parser + Embedder"):
         with st.spinner("Refreshing knowledge base..."):
             try:
-                file_parser.main()       # parses ./reminders into ./parsed_data + (optional) Drive
-                embed_and_store.main()   # re-embeds and writes FAISS + metadata
+                # If your file_parser/embed_and_store use DATA_DIR, they will respect BASE_DIR
+                file_parser.main()
+                embed_and_store.main()
                 save_refresh_time()
                 st.success("Data refreshed and embedded successfully.")
                 st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
@@ -339,7 +413,7 @@ elif mode == "💬 New Chat":
     # Chat input
     user_msg = st.chat_input("Type your question or add a REMINDER…")
     if user_msg:
-        # 1) If this is a REMINDER, save it immediately to ./reminders
+        # 1) If this is a REMINDER, save it immediately to DATA_DIR/reminders
         if user_msg.strip().lower().startswith("reminder:"):
             body = re.sub(r"^reminder:\s*", "", user_msg.strip(), flags=re.I)
             title_hint = body.split("\n", 1)[0][:60]
