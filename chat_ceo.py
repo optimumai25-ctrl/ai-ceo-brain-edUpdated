@@ -218,6 +218,10 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
     fp.write_text(payload, encoding="utf-8")
     return str(fp)
 
+def _preview_snippet(text: str, limit: int = 80) -> str:
+    """Make a one-line preview without using backslashes in f-string exprs."""
+    return " ".join((text or "").splitlines())[:limit]
+
 # ─────────────────────────────────────────────────────────────
 # History editing helpers
 # ─────────────────────────────────────────────────────────────
@@ -362,7 +366,7 @@ if mode == "🔁 Refresh Data":
     c2.metric("Parsed .txt files", parsed_ct)
     c3.metric("Has embedding_report.csv", "Yes" if report_exists else "No")
 
-    # Helper button: create a demo reminder so you can test end-to-end
+    # Helper button: create a demo REMINDER so you can test end-to-end
     if st.button("📝 Create demo REMINDER"):
         demo = (
             "Title: Q4 KPIs\n"
@@ -438,7 +442,7 @@ elif mode == "✏️ Edit Conversation":
         st.info("No chat history found.")
     else:
         options = [
-            f"{i}: {turn.get('role','?')} | [{turn.get('timestamp','N/A')}] | {turn.get('content','')[:80].replace('\n',' ')}"
+            f"{i}: {turn.get('role','?')} | [{turn.get('timestamp','N/A')}] | {_preview_snippet(turn.get('content',''))}"
             for i, turn in enumerate(history)
         ]
         sel = st.selectbox("Select a turn to edit", options, index=0)
