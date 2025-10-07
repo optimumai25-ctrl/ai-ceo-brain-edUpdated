@@ -19,7 +19,7 @@ load_dotenv()
 # Prefer new SDK, fallback to legacy
 try:
     from openai import OpenAI
-    _client = OpenAI()
+    _client = OpenAI()   # needs OPENAI_API_KEY in env
     _use_client = True
 except Exception:
     _client = None
@@ -27,12 +27,15 @@ except Exception:
     import openai  # type: ignore
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
-PARSED_DIR = Path("parsed_data")
-EMBED_DIR = Path("embeddings")
+# ------------ IMPORTANT: honor DATA_DIR like the Streamlit app ------------
+BASE_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
+PARSED_DIR = BASE_DIR / "parsed_data"
+EMBED_DIR = BASE_DIR / "embeddings"
 EMBED_DIR.mkdir(parents=True, exist_ok=True)
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIM = 1536
+
 INDEX_PATH = EMBED_DIR / "faiss.index"
 META_PATH = EMBED_DIR / "metadata.pkl"
 REPORT_CSV = EMBED_DIR / "embedding_report.csv"
@@ -55,32 +58,21 @@ _HUMAN_MEETING = re.compile(
 )
 _MONTHS_MAP = {
     m.lower(): i for i, m in enumerate(
-        ["January", "February", "March", "April", "May", "June",
-         "July", "August", "September", "October", "November", "December"], start=1
+        ["January","February","March","April","May","June",
+         "July","August","September","October","November","December"], start=1
     )
 }
-# Also allow short month keys
-_MONTHS_MAP.update({
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12
-})
-
+_MONTHS_MAP.update({"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                    "jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12})
 
 def _date_from_filename(fname: str) -> Optional[str]:
-    """
-    Returns ISO date (YYYY-MM-DD) if filename encodes a meeting date in either style:
-    1) 2025-09-02_Meeting-Summary...
-    2) Meeting_Summary_02-September-2025 (or short month)
-    """
     stem = Path(fname).stem
-
     m = _CANON_MEETING.match(stem)
     if m:
         try:
             return datetime(int(m["y"]), int(m["m"]), int(m["d"])).strftime("%Y-%m-%d")
         except Exception:
             pass
-
     h = _HUMAN_MEETING.match(stem)
     if h:
         try:
@@ -92,12 +84,9 @@ def _date_from_filename(fname: str) -> Optional[str]:
                 return datetime(year, mon, day).strftime("%Y-%m-%d")
         except Exception:
             pass
-
     return None
 
-
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
 
 def _coerce_iso(d: Optional[str]) -> Optional[str]:
     if not d:
@@ -105,55 +94,40 @@ def _coerce_iso(d: Optional[str]) -> Optional[str]:
     d = d.strip()
     if ISO_DATE.match(d):
         return d
-    for fmt in ("%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%b %d %Y", "%B %d %Y"):
+    for fmt in ("%Y/%m/%d","%d-%m-%Y","%d/%m/%Y","%b %d %Y","%B %d %Y"):
         try:
             return datetime.strptime(d, fmt).strftime("%Y-%m-%d")
         except Exception:
             pass
     return None
 
-
 def _extract_headers(text: str) -> dict:
-    """
-    Read first ~25 lines of parsed file to capture:
-      - [FOLDER], [FILE]
-      - For 'Reminders' files: Title/Tags/ValidFrom/ValidTo if present
-    """
-    out = {
-        "folder": "",
-        "original_file": "",
-        "title": "",
-        "tags": [],
-        "valid_from": None,
-        "valid_to": None,
-    }
+    out = {"folder":"","original_file":"","title":"","tags":[],
+           "valid_from":None,"valid_to":None}
     lines = text.splitlines()[:25]
     for ln in lines:
         if ln.startswith("[FOLDER]:"):
-            out["folder"] = ln.split(":", 1)[1].strip()
+            out["folder"] = ln.split(":",1)[1].strip()
         elif ln.startswith("[FILE]:"):
-            out["original_file"] = ln.split(":", 1)[1].strip()
+            out["original_file"] = ln.split(":",1)[1].strip()
         elif ln.lower().startswith("title:"):
-            out["title"] = ln.split(":", 1)[1].strip()
+            out["title"] = ln.split(":",1)[1].strip()
         elif ln.lower().startswith("tags:"):
-            tags = ln.split(":", 1)[1]
+            tags = ln.split(":",1)[1]
             out["tags"] = [t.strip().lower() for t in re.split(r"[;,]", tags) if t.strip()]
         elif ln.lower().startswith("validfrom:"):
-            out["valid_from"] = _coerce_iso(ln.split(":", 1)[1])
+            out["valid_from"] = _coerce_iso(ln.split(":",1)[1])
         elif ln.lower().startswith("validto:"):
-            out["valid_to"] = _coerce_iso(ln.split(":", 1)[1])
+            out["valid_to"] = _coerce_iso(ln.split(":",1)[1])
     return out
-
 
 def _embed_client(text: str) -> np.ndarray:
     resp = _client.embeddings.create(model=EMBED_MODEL, input=text)
     return np.asarray(resp.data[0].embedding, dtype=np.float32)
 
-
 def _embed_legacy(text: str) -> np.ndarray:
     resp = openai.Embedding.create(model=EMBED_MODEL, input=text)  # type: ignore
     return np.asarray(resp["data"][0]["embedding"], dtype=np.float32)
-
 
 def get_embedding(text: str) -> Optional[np.ndarray]:
     for attempt in range(4):
@@ -164,50 +138,42 @@ def get_embedding(text: str) -> Optional[np.ndarray]:
             return arr
         except Exception as e:
             wait = 1.5 ** attempt
-            print(f"Embedding error (attempt {attempt + 1}): {e}. Retrying in {wait:.1f}s...")
+            print(f"Embedding error (attempt {attempt+1}): {e}. Retrying in {wait:.1f}s...")
             time.sleep(wait)
     print("Failed to embed after retries.")
     return None
 
-
 def add_to_index(vec: np.ndarray, vid: int) -> None:
     _index.add_with_ids(vec.reshape(1, -1), np.array([vid], dtype=np.int64))
 
-
 def _load_registry() -> Dict[str, Dict]:
-    """
-    Load knowledge_registry.csv (if present) to decide keep/supersede.
-    Keyed by absolute path string in the 'path' column.
-    """
     reg: Dict[str, Dict] = {}
     if REG_CSV.exists():
         with open(REG_CSV, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                reg[row.get("path", "")] = row
+                reg[row.get("path","")] = row
     return reg
-
 
 def main():
     global _next_id
     if not PARSED_DIR.exists():
-        print(f"Missing folder: {PARSED_DIR.resolve()}")
+        print(f"Missing folder: {PARSED_DIR}")
         return
 
     files = sorted([p for p in PARSED_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".txt"])
     if not files:
-        print("No .txt files found in parsed_data.")
+        print(f"No .txt files found in {PARSED_DIR}. (Did you create REMINDERs and run file_parser?)")
         return
 
     registry = _load_registry()
 
-    print(f"Found {len(files)} files to embed.")
+    print(f"Found {len(files)} files to embed from {PARSED_DIR}")
     report_rows: List[tuple] = [(
-        "filename", "folder", "meeting_date", "title", "tags", "valid_from", "valid_to",
-        "canonical_key", "version_ts", "chunks", "chars"
+        "filename","folder","meeting_date","title","tags","valid_from","valid_to",
+        "canonical_key","version_ts","chunks","chars"
     )]
 
     for fp in tqdm(files, desc="Embedding"):
-        # Skip archived files if registry says so
         reg_row = registry.get(str(fp))
         if reg_row and reg_row.get("status") == "archived":
             continue
@@ -221,16 +187,16 @@ def main():
         folder_label = headers["folder"]
         orig_name = headers["original_file"] or fp.name
 
-        meeting_date_iso = _date_from_filename(orig_name) if folder_label.lower() == "meetings" else None
+        meeting_date_iso = _date_from_filename(orig_name) if folder_label.lower() == "reminders" else None
         title = headers["title"]
         tags = headers["tags"]
         valid_from = headers["valid_from"]
         valid_to = headers["valid_to"]
 
-        # Derive canonical_key and version_ts
+        # Derive canonical_key/version_ts
         if reg_row:
-            canonical_key = reg_row.get("canonical_key", "") or (title or Path(fp.name).stem).lower()
-            version_ts = reg_row.get("version_ts", "") or (meeting_date_iso or valid_from or "")
+            canonical_key = reg_row.get("canonical_key","") or (title or Path(fp.name).stem).lower()
+            version_ts = reg_row.get("version_ts","") or (meeting_date_iso or valid_from or "")
         else:
             if folder_label.lower() == "meetings":
                 canonical_key = Path(fp.name).stem.lower()
@@ -253,18 +219,11 @@ def main():
                 continue
             add_to_index(vec, _next_id)
             _metadata[_next_id] = {
-                "filename": fp.name,
-                "path": str(fp),
-                "chunk_id": ch["chunk_id"],
-                "text_preview": ch["text"][:1000],
-                "folder": folder_label,
-                "meeting_date": meeting_date_iso,
-                "title": title,
-                "tags": tags,
-                "valid_from": valid_from,
-                "valid_to": valid_to,
-                "canonical_key": canonical_key,
-                "version_ts": version_ts,
+                "filename": fp.name, "path": str(fp), "chunk_id": ch["chunk_id"],
+                "text_preview": ch["text"][:1000], "folder": folder_label,
+                "meeting_date": meeting_date_iso, "title": title, "tags": tags,
+                "valid_from": valid_from, "valid_to": valid_to,
+                "canonical_key": canonical_key, "version_ts": version_ts,
             }
             _next_id += 1
 
@@ -279,7 +238,7 @@ def main():
     print(f"Saved metadata for {len(_metadata)} vectors to {META_PATH}")
     print(f"Wrote embedding health report to {REPORT_CSV}")
 
-
 if __name__ == "__main__":
     main()
+
 
