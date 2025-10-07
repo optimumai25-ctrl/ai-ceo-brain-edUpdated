@@ -340,25 +340,74 @@ st.sidebar.caption("💡 Tip: Start a message with **REMINDER:** to teach the as
 if mode == "🔁 Refresh Data":
     st.title("🔁 Refresh AI Knowledge Base")
     st.caption("Parses local reminders + (optional) Google Drive docs, then re-embeds.")
-    st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
 
-    # Ensure directories exist before running pipelines
-    for p in [REMINDERS_DIR, EMBED_DIR, PARSED_DIR]:
+    # Show where we are writing/reading
+    st.markdown(f"**DATA_DIR:** `{BASE_DIR}`")
+    st.markdown(f"**Reminders dir:** `{REMINDERS_DIR}`")
+    st.markdown(f"**Parsed dir:** `{PARSED_DIR}`")
+    st.markdown(f"**Embeddings dir:** `{EMBED_DIR}`")
+
+    # Ensure directories exist
+    for p in [REMINDERS_DIR, PARSED_DIR, EMBED_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
-    disabled = file_parser is None or embed_and_store is None
+    # Quick counts
+    rem_ct = len(list(REMINDERS_DIR.glob("*.txt")))
+    parsed_ct = len(list(PARSED_DIR.glob("*.txt")))
+    report_path = EMBED_DIR / "embedding_report.csv"
+    report_exists = report_path.exists()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Local REMINDER files", rem_ct)
+    c2.metric("Parsed .txt files", parsed_ct)
+    c3.metric("Has embedding_report.csv", "Yes" if report_exists else "No")
+
+    # Helper button: create a demo reminder so you can test end-to-end
+    if st.button("📝 Create demo REMINDER"):
+        demo = (
+            "Title: Q4 KPIs\n"
+            "Tags: reminder, okr\n"
+            f"ValidFrom: {datetime.now():%Y-%m-%d}\n"
+            "Body: Revenue target 10% QoQ, NPS ≥ 60, ship AI dashboard by Nov 15.\n"
+        )
+        path = save_reminder_local(demo, title_hint="Q4_KPIs")
+        st.success(f"Demo reminder saved at: {path}")
+
+    # Run pipelines
+    disabled = (file_parser is None or embed_and_store is None)
     if disabled:
         st.warning("`file_parser.py` and/or `embed_and_store.py` not found. Add them to your repo.")
-    if st.button("Run File Parser + Embedder", disabled=disabled):
+    if st.button("🚀 Run File Parser + Embedder", disabled=disabled):
         with st.spinner("Refreshing knowledge base..."):
             try:
+                # 1) parse reminders (and optional Drive) into PARSED_DIR
                 file_parser.main()
-                embed_and_store.main()
+
+                # Recount parsed files so we know if there is anything to embed
+                parsed_ct = len(list(PARSED_DIR.glob("*.txt")))
+                if parsed_ct == 0:
+                    st.warning("No parsed files found. Create a REMINDER (or enable Drive) and run again.")
+                else:
+                    # 2) embed into EMBED_DIR
+                    embed_and_store.main()
+
                 save_refresh_time()
-                st.success("✅ Data refreshed and embedded successfully.")
-                st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
+                st.success("✅ Data refreshed.")
             except Exception as e:
                 st.error(f"Failed: {e}")
+
+    st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
+
+    # If a report exists, show a peek so you can verify
+    if report_path.exists():
+        try:
+            df = pd.read_csv(report_path)
+            st.caption(f"🧾 Embedding report rows: {len(df)}")
+            st.dataframe(df.tail(20), use_container_width=True, height=240)
+        except Exception as e:
+            st.warning(f"Found report but failed to read it: {e}")
+    else:
+        st.info("No embedding report yet. Create a REMINDER and run the parser + embedder.")
 
 elif mode == "📜 View History":
     st.title("📜 Chat History")
