@@ -2,12 +2,11 @@
 # AI CEO Assistant — Render-ready Streamlit app
 # -------------------------------------------------------------
 # FEATURES
-# - Always-on friendly: all data written under DATA_DIR (env) or "."
-# - Robust env/secrets handling for APP_USER/APP_PASS and Google SA
+# - DATA_DIR-aware (for Cloud Run / Render persistence)
+# - Env/secrets for APP_USER/APP_PASS and optional Google Drive SA
 # - Modes: New Chat, View History, Edit Conversation, Refresh Data
-# - REMINDER: prefix in chat creates structured reminder files
+# - REMINDER: prefix creates structured reminder files
 # - Refresh Data runs file_parser.main() + embed_and_store.main()
-# - Safe fallbacks if optional modules are missing
 # -------------------------------------------------------------
 
 import os
@@ -21,25 +20,20 @@ import streamlit as st
 
 # ─────────────────────────────────────────────────────────────
 # Optional local modules (handle missing gracefully)
-# Ensure these files exist in your repo root:
-#   - file_parser.py          (must expose main())
-#   - embed_and_store.py      (must expose main())
-#   - answer_with_rag.py      (must expose answer(prompt, ...))
-# If names differ, change the imports below accordingly.
 # ─────────────────────────────────────────────────────────────
 try:
     import file_parser  # type: ignore
-except Exception as _e:
+except Exception:
     file_parser = None
 
 try:
     import embed_and_store  # type: ignore
-except Exception as _e:
+except Exception:
     embed_and_store = None
 
 try:
     from answer_with_rag import answer  # type: ignore
-except Exception as _e:
+except Exception:
     # Simple fallback if your RAG module isn't present yet
     def answer(prompt, k=7, chat_history=None, restrict_to_meetings=False, use_rag=True):
         return (
@@ -84,7 +78,9 @@ def load_gdrive_service_account():
 
     # Assemble from individual env fields (or from secrets.gdrive)
     gsecrets = _get_from_st_secrets("gdrive", {}) or {}
-    pk = (os.getenv("GDRIVE_PRIVATE_KEY", "") or gsecrets.get("private_key", "")).replace("\\n", "\n")
+    pk_env = os.getenv("GDRIVE_PRIVATE_KEY", "")
+    pk_secret = gsecrets.get("private_key", "")
+    pk = (pk_env or pk_secret).replace("\\n", "\n")  # safe newline normalization
 
     assembled = {
         "type": os.getenv("GDRIVE_TYPE") or gsecrets.get("type"),
@@ -113,7 +109,7 @@ PASSWORD = get_cred("APP_PASS", "BestOrg123@#")
 GDRIVE_SA = load_gdrive_service_account()  # available if needed elsewhere
 
 # ─────────────────────────────────────────────────────────────
-# Paths (honor DATA_DIR for Render/VPS persistent disks)
+# Paths (honor DATA_DIR for Cloud Run persistent disks)
 # ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -210,7 +206,7 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
     else:
         payload = (
             f"Title: {title}\n"
-            f"Tags: reminder\n"
+            "Tags: reminder\n"
             f"ValidFrom: {datetime.now():%Y-%m-%d}\n"
             f"Body: {content.strip()}\n"
         )
@@ -219,7 +215,8 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
     return str(fp)
 
 def _preview_snippet(text: str, limit: int = 80) -> str:
-    """Make a one-line preview without using backslashes in f-string exprs."""
+    """One-line preview without backslashes inside f-string expressions."""
+    # Avoid .replace('\n',' ') inside f-string expressions
     return " ".join((text or "").splitlines())[:limit]
 
 # ─────────────────────────────────────────────────────────────
@@ -441,10 +438,14 @@ elif mode == "✏️ Edit Conversation":
     if not history:
         st.info("No chat history found.")
     else:
-        options = [
-            f"{i}: {turn.get('role','?')} | [{turn.get('timestamp','N/A')}] | {_preview_snippet(turn.get('content',''))}"
-            for i, turn in enumerate(history)
-        ]
+        # Build options safely (no backslashes inside f-string expressions)
+        options = []
+        for i, turn in enumerate(history):
+            role = turn.get("role", "?")
+            ts = turn.get("timestamp", "N/A")
+            preview = _preview_snippet(turn.get("content", ""))
+            options.append(f"{i}: {role} | [{ts}] | {preview}")
+
         sel = st.selectbox("Select a turn to edit", options, index=0)
         idx = int(sel.split(":", 1)[0])
         turn = history[idx]
