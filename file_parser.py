@@ -9,14 +9,12 @@ import pandas as pd
 from PyPDF2 import PdfReader
 import fitz  # PyMuPDF
 
-# ==== ROOT under DATA_DIR ====
-DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-OUTPUT_DIR = DATA_DIR / "parsed_data"
+# ------------ IMPORTANT: honor DATA_DIR like the Streamlit app ------------
+BASE_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
+OUTPUT_DIR = BASE_DIR / "parsed_data"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-REMINDERS_LOCAL_DIR = DATA_DIR / "reminders"   # <-- where chat_ceo.py saves REMINDER files
+REMINDERS_DIR = BASE_DIR / "reminders"
 LOWTEXT_LOG = OUTPUT_DIR / "low_text_files.csv"
 
 # Optional Google Drive auth — safely skipped if secrets not present
@@ -135,13 +133,13 @@ def process_and_save_drive(file, folder_label):
         print(f"❌ Error processing {name}: {e}")
 
 # ─────────────────────────────────────────────────────────────
-# Parse local reminders (*.txt in DATA_DIR/reminders) → DATA_DIR/parsed_data
+# Parse local reminders (*.txt) → parsed_data
 # ─────────────────────────────────────────────────────────────
 def parse_local_reminders():
-    folder = REMINDERS_LOCAL_DIR
-    if not folder.exists():
+    if not REMINDERS_DIR.exists():
+        print(f"(No local reminders yet in {REMINDERS_DIR})")
         return
-    for fp in folder.glob("*.txt"):
+    for fp in REMINDERS_DIR.glob("*.txt"):
         text = fp.read_text(encoding="utf-8")
         write_parsed_output("Reminders", fp.name, text)
 
@@ -173,8 +171,6 @@ def parse_reminders_drive():
 # ─────────────────────────────────────────────────────────────
 def main():
     print(f"🔎 Parsing sources into {OUTPUT_DIR} …")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     # Always parse local reminders first
     parse_local_reminders()
 
@@ -193,3 +189,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
