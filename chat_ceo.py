@@ -1,3 +1,15 @@
+# chat_ceo.py
+# AI CEO Assistant — Render-ready Streamlit app
+# -------------------------------------------------------------
+# FEATURES
+# - Always-on friendly: all data written under DATA_DIR (env) or "."
+# - Robust env/secrets handling for APP_USER/APP_PASS and Google SA
+# - Modes: New Chat, View History, Edit Conversation, Refresh Data
+# - REMINDER: prefix in chat creates structured reminder files
+# - Refresh Data runs file_parser.main() + embed_and_store.main()
+# - Safe fallbacks if optional modules are missing
+# -------------------------------------------------------------
+
 import os
 import json
 import re
@@ -7,12 +19,37 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-import file_parser
-import embed_and_store
-from answer_with_rag import answer
+# ─────────────────────────────────────────────────────────────
+# Optional local modules (handle missing gracefully)
+# Ensure these files exist in your repo root:
+#   - file_parser.py          (must expose main())
+#   - embed_and_store.py      (must expose main())
+#   - answer_with_rag.py      (must expose answer(prompt, ...))
+# If names differ, change the imports below accordingly.
+# ─────────────────────────────────────────────────────────────
+try:
+    import file_parser  # type: ignore
+except Exception as _e:
+    file_parser = None
+
+try:
+    import embed_and_store  # type: ignore
+except Exception as _e:
+    embed_and_store = None
+
+try:
+    from answer_with_rag import answer  # type: ignore
+except Exception as _e:
+    # Simple fallback if your RAG module isn't present yet
+    def answer(prompt, k=7, chat_history=None, restrict_to_meetings=False, use_rag=True):
+        return (
+            "RAG module not available. Echoing your message:\n\n"
+            f"> {prompt}\n\n"
+            "Add answer_with_rag.py with an `answer()` function for real responses."
+        )
 
 # ─────────────────────────────────────────────────────────────
-# App Config
+# App Config (Streamlit)
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI CEO Assistant 🧠", page_icon="🧠", layout="wide")
 
@@ -20,57 +57,50 @@ st.set_page_config(page_title="AI CEO Assistant 🧠", page_icon="🧠", layout=
 # Helpers: robust secrets/env access
 # ─────────────────────────────────────────────────────────────
 def _get_from_st_secrets(key, default=None):
-    """Safely read from st.secrets without crashing if secrets.toml is missing."""
+    """Safely read from st.secrets; return default if not present."""
     try:
-        # Accessing st.secrets may raise StreamlitSecretNotFoundError if no file is present
         return st.secrets.get(key, default)
     except Exception:
         return default
 
 def get_cred(key, default=None):
-    """Environment-first; fallback to st.secrets; then to default."""
+    """Environment-first; fallback to st.secrets (lowercase key); then default."""
     val = os.getenv(key)
     if val is not None and val != "":
         return val
-    return _get_from_st_secrets(key.lower(), default)  # allow 'app_user' style locally
+    return _get_from_st_secrets(key.lower(), default)
 
 def load_gdrive_service_account():
     """
     Construct a Google service account JSON dict from environment variables,
-    with a fallback to st.secrets['gdrive'] for local development.
-    Expected env vars (you already created these in Railway):
-      GDRIVE_TYPE, GDRIVE_PROJECT_ID, GDRIVE_PRIVATE_KEY_ID, GDRIVE_PRIVATE_KEY,
-      GDRIVE_CLIENT_EMAIL, GDRIVE_CLIENT_ID, GDRIVE_AUTH_URI, GDRIVE_TOKEN_URI,
-      GDRIVE_AUTH_PROVIDER_X509_CERT_URL, GDRIVE_CLIENT_X509_CERT_URL, GDRIVE_UNIVERSE_DOMAIN
+    with a fallback to st.secrets['gdrive'].
     """
-    # If a single JSON blob was provided (optional), prefer it:
     blob = os.getenv("GDRIVE_SA_JSON")
     if blob:
         try:
             return json.loads(blob)
         except json.JSONDecodeError:
-            pass  # fall through to field-by-field assembly
+            pass
 
-    # Assemble from individual fields
-    pk = os.getenv("GDRIVE_PRIVATE_KEY", "")
-    # Allow either real newlines or \n-escaped value
-    pk = pk.replace("\\n", "\n")
+    # Assemble from individual env fields (or from secrets.gdrive)
+    gsecrets = _get_from_st_secrets("gdrive", {}) or {}
+    pk = (os.getenv("GDRIVE_PRIVATE_KEY", "") or gsecrets.get("private_key", "")).replace("\\n", "\n")
 
     assembled = {
-        "type": os.getenv("GDRIVE_TYPE") or _get_from_st_secrets("gdrive", {}).get("type"),
-        "project_id": os.getenv("GDRIVE_PROJECT_ID") or _get_from_st_secrets("gdrive", {}).get("project_id"),
-        "private_key_id": os.getenv("GDRIVE_PRIVATE_KEY_ID") or _get_from_st_secrets("gdrive", {}).get("private_key_id"),
-        "private_key": pk or _get_from_st_secrets("gdrive", {}).get("private_key"),
-        "client_email": os.getenv("GDRIVE_CLIENT_EMAIL") or _get_from_st_secrets("gdrive", {}).get("client_email"),
-        "client_id": os.getenv("GDRIVE_CLIENT_ID") or _get_from_st_secrets("gdrive", {}).get("client_id"),
-        "auth_uri": os.getenv("GDRIVE_AUTH_URI") or _get_from_st_secrets("gdrive", {}).get("auth_uri"),
-        "token_uri": os.getenv("GDRIVE_TOKEN_URI") or _get_from_st_secrets("gdrive", {}).get("token_uri"),
-        "auth_provider_x509_cert_url": os.getenv("GDRIVE_AUTH_PROVIDER_X509_CERT_URL") or _get_from_st_secrets("gdrive", {}).get("auth_provider_x509_cert_url"),
-        "client_x509_cert_url": os.getenv("GDRIVE_CLIENT_X509_CERT_URL") or _get_from_st_secrets("gdrive", {}).get("client_x509_cert_url"),
-        "universe_domain": os.getenv("GDRIVE_UNIVERSE_DOMAIN") or _get_from_st_secrets("gdrive", {}).get("universe_domain"),
+        "type": os.getenv("GDRIVE_TYPE") or gsecrets.get("type"),
+        "project_id": os.getenv("GDRIVE_PROJECT_ID") or gsecrets.get("project_id"),
+        "private_key_id": os.getenv("GDRIVE_PRIVATE_KEY_ID") or gsecrets.get("private_key_id"),
+        "private_key": pk,
+        "client_email": os.getenv("GDRIVE_CLIENT_EMAIL") or gsecrets.get("client_email"),
+        "client_id": os.getenv("GDRIVE_CLIENT_ID") or gsecrets.get("client_id"),
+        "auth_uri": os.getenv("GDRIVE_AUTH_URI") or gsecrets.get("auth_uri"),
+        "token_uri": os.getenv("GDRIVE_TOKEN_URI") or gsecrets.get("token_uri"),
+        "auth_provider_x509_cert_url": os.getenv("GDRIVE_AUTH_PROVIDER_X509_CERT_URL") or gsecrets.get("auth_provider_x509_cert_url"),
+        "client_x509_cert_url": os.getenv("GDRIVE_CLIENT_X509_CERT_URL") or gsecrets.get("client_x509_cert_url"),
+        "universe_domain": os.getenv("GDRIVE_UNIVERSE_DOMAIN") or gsecrets.get("universe_domain"),
     }
 
-    # If even 'type' and 'client_email' are empty, treat as unavailable
+    # If clearly unconfigured, return None
     if not assembled["type"] and not assembled["client_email"]:
         return None
     return assembled
@@ -80,14 +110,12 @@ def load_gdrive_service_account():
 # ─────────────────────────────────────────────────────────────
 USERNAME = get_cred("APP_USER", "admin123")
 PASSWORD = get_cred("APP_PASS", "BestOrg123@#")
-
-# Make the service account JSON available if needed elsewhere
-GDRIVE_SA = load_gdrive_service_account()
+GDRIVE_SA = load_gdrive_service_account()  # available if needed elsewhere
 
 # ─────────────────────────────────────────────────────────────
-# Paths (honor DATA_DIR for Railway/Docker volumes)
+# Paths (honor DATA_DIR for Render/VPS persistent disks)
 # ─────────────────────────────────────────────────────────────
-BASE_DIR = Path(os.getenv("DATA_DIR", "."))
+BASE_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 HIST_PATH = BASE_DIR / "chat_history.json"
@@ -126,22 +154,37 @@ if not st.session_state["authenticated"]:
 # ─────────────────────────────────────────────────────────────
 def load_history():
     if HIST_PATH.exists():
-        return json.loads(HIST_PATH.read_text(encoding="utf-8"))
+        try:
+            return json.loads(HIST_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
     return []
 
 def save_history(history):
-    HIST_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        HIST_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        st.error(f"Failed to save history: {e}")
 
 def reset_chat():
-    if HIST_PATH.exists():
-        HIST_PATH.unlink()
+    try:
+        if HIST_PATH.exists():
+            HIST_PATH.unlink()
+    except Exception as e:
+        st.error(f"Failed to clear history: {e}")
 
 def save_refresh_time():
-    REFRESH_PATH.write_text(datetime.now().strftime("%b-%d-%Y %I:%M %p"))
+    try:
+        REFRESH_PATH.write_text(datetime.now().strftime("%b-%d-%Y %I:%M %p"))
+    except Exception as e:
+        st.error(f"Failed to update refresh time: {e}")
 
 def load_refresh_time():
-    if REFRESH_PATH.exists():
-        return REFRESH_PATH.read_text()
+    try:
+        if REFRESH_PATH.exists():
+            return REFRESH_PATH.read_text()
+    except Exception:
+        pass
     return "Never"
 
 def export_history_to_csv(history: list) -> bytes:
@@ -201,6 +244,7 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
 
     ctx = history[: idx + 1]
 
+    # Call into your RAG function; handle signature variance
     try:
         reply = answer(
             history[idx]["content"],
@@ -217,6 +261,7 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
             restrict_to_meetings=limit_meetings,
         )
 
+    # Find next assistant turn to replace, if any
     next_assistant = None
     for j in range(idx + 1, len(history)):
         if history[j].get("role") == "assistant":
@@ -248,15 +293,18 @@ st.sidebar.markdown(f"👥 Logged in as: `{USERNAME}`")
 with st.sidebar.expander("📊 Index health (embeddings)"):
     try:
         report_path = EMBED_DIR / "embedding_report.csv"
-        df = pd.read_csv(report_path)
-        st.caption(f"🧾 Rows: {len(df)}")
-        if set(["chunks", "chars"]).issubset(df.columns):
-            bad = df[(df["chunks"] == 0) | (df["chars"] < 200)]
-            if len(bad):
-                st.warning(f"⚠️ {len(bad)} file(s) look sparse (<200 chars or 0 chunks).")
-        st.dataframe(df.tail(50), use_container_width=True, height=220)
-    except Exception:
-        st.caption("ℹ️ No report yet. Run **Refresh Data**.")
+        if report_path.exists():
+            df = pd.read_csv(report_path)
+            st.caption(f"🧾 Rows: {len(df)}")
+            if set(["chunks", "chars"]).issubset(df.columns):
+                bad = df[(df["chunks"] == 0) | (df["chars"] < 200)]
+                if len(bad):
+                    st.warning(f"⚠️ {len(bad)} file(s) look sparse (<200 chars or 0 chunks).")
+            st.dataframe(df.tail(50), use_container_width=True, height=220)
+        else:
+            st.caption("ℹ️ No report yet. Run **Refresh Data**.")
+    except Exception as e:
+        st.caption(f"ℹ️ Could not read embedding report: {e}")
 
 with st.sidebar.expander("🧹 Curate & Restack", expanded=False):
     if not HAS_CURATOR:
@@ -266,6 +314,8 @@ with st.sidebar.expander("🧹 Curate & Restack", expanded=False):
             try:
                 import knowledge_curator  # type: ignore
                 knowledge_curator.main()
+                if file_parser is None or embed_and_store is None:
+                    raise RuntimeError("file_parser or embed_and_store not available.")
                 file_parser.main()
                 embed_and_store.main()
                 save_refresh_time()
@@ -292,14 +342,20 @@ if mode == "🔁 Refresh Data":
     st.caption("Parses local reminders + (optional) Google Drive docs, then re-embeds.")
     st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
 
-    if st.button("Run File Parser + Embedder"):
+    # Ensure directories exist before running pipelines
+    for p in [REMINDERS_DIR, EMBED_DIR, PARSED_DIR]:
+        p.mkdir(parents=True, exist_ok=True)
+
+    disabled = file_parser is None or embed_and_store is None
+    if disabled:
+        st.warning("`file_parser.py` and/or `embed_and_store.py` not found. Add them to your repo.")
+    if st.button("Run File Parser + Embedder", disabled=disabled):
         with st.spinner("Refreshing knowledge base..."):
             try:
-                # If your file_parser/embed_and_store use DATA_DIR, they will respect BASE_DIR
                 file_parser.main()
                 embed_and_store.main()
                 save_refresh_time()
-                st.success("Data refreshed and embedded successfully.")
+                st.success("✅ Data refreshed and embedded successfully.")
                 st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
             except Exception as e:
                 st.error(f"Failed: {e}")
@@ -392,13 +448,13 @@ elif mode == "💬 New Chat":
 
     colA, colB = st.columns([1, 1])
     with colA:
-        limit_meetings = st.checkbox(
+        st.checkbox(
             "Limit retrieval to Meetings",
             value=st.session_state["limit_meetings"],
             key="limit_meetings",
         )
     with colB:
-        use_rag = st.checkbox(
+        st.checkbox(
             "Use internal knowledge (RAG)",
             value=st.session_state["use_rag"],
             key="use_rag",
@@ -435,6 +491,7 @@ elif mode == "💬 New Chat":
                         use_rag=st.session_state["use_rag"],
                     )
                 except TypeError:
+                    # Backward-compatible signature
                     reply = answer(
                         user_msg,
                         k=7,
