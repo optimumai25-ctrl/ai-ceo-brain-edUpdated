@@ -9,6 +9,16 @@ import pandas as pd
 from PyPDF2 import PdfReader
 import fitz  # PyMuPDF
 
+# ==== ROOT under DATA_DIR ====
+DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+OUTPUT_DIR = DATA_DIR / "parsed_data"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+REMINDERS_LOCAL_DIR = DATA_DIR / "reminders"   # <-- where chat_ceo.py saves REMINDER files
+LOWTEXT_LOG = OUTPUT_DIR / "low_text_files.csv"
+
 # Optional Google Drive auth — safely skipped if secrets not present
 try:
     from googleapiclient.discovery import build
@@ -24,12 +34,8 @@ try:
 except Exception:
     service = None  # no Drive available
 
-KB_FOLDER_NAME = "AI_CEO_KnowledgeBase"   # optional; parsed if Drive is configured
+KB_FOLDER_NAME = "AI_CEO_KnowledgeBase"    # optional; parsed if Drive is configured
 REMINDERS_FOLDER_NAME = "AI_CEO_Reminders" # optional; parsed if Drive is configured
-OUTPUT_DIR = Path("parsed_data")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-LOWTEXT_LOG = OUTPUT_DIR / "low_text_files.csv"
 
 # ─────────────────────────────────────────────────────────────
 # Drive helpers (only used if 'service' is available)
@@ -129,10 +135,10 @@ def process_and_save_drive(file, folder_label):
         print(f"❌ Error processing {name}: {e}")
 
 # ─────────────────────────────────────────────────────────────
-# Parse local reminders (*.txt) → parsed_data
+# Parse local reminders (*.txt in DATA_DIR/reminders) → DATA_DIR/parsed_data
 # ─────────────────────────────────────────────────────────────
 def parse_local_reminders():
-    folder = Path("reminders")
+    folder = REMINDERS_LOCAL_DIR
     if not folder.exists():
         return
     for fp in folder.glob("*.txt"):
@@ -166,7 +172,9 @@ def parse_reminders_drive():
 # Main
 # ─────────────────────────────────────────────────────────────
 def main():
-    print("🔎 Parsing sources into parsed_data/*.txt …")
+    print(f"🔎 Parsing sources into {OUTPUT_DIR} …")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     # Always parse local reminders first
     parse_local_reminders()
 
