@@ -17,18 +17,43 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 REMINDERS_DIR = BASE_DIR / "reminders"
 LOWTEXT_LOG = OUTPUT_DIR / "low_text_files.csv"
 
-# Optional Google Drive auth — safely skipped if secrets not present
+# -----------------------------------------------------------------------------
+# Optional Google Drive auth — now supports ENV (GDRIVE_SA_JSON) or st.secrets
+# -----------------------------------------------------------------------------
 try:
+    import json
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseDownload
     from google.oauth2 import service_account
+
     SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-    gdrive_secrets = st.secrets.get("gdrive", None)
-    if gdrive_secrets:
-        creds = service_account.Credentials.from_service_account_info(dict(gdrive_secrets), scopes=SCOPES)
+
+    # 1) Prefer env var GDRIVE_SA_JSON (bound from Secret Manager in Cloud Run)
+    gdrive_blob = os.getenv("GDRIVE_SA_JSON", "")
+
+    # 2) Fallback to st.secrets['gdrive'] if present (useful for local dev)
+    gdrive_secrets = None
+    try:
+        gdrive_secrets = st.secrets.get("gdrive", None)
+    except Exception:
+        pass
+
+    creds_info = None
+    if gdrive_blob:
+        # Accept both raw JSON and TOML-style block where the value is JSON
+        try:
+            creds_info = json.loads(gdrive_blob)
+        except json.JSONDecodeError:
+            # Sometimes the secret is wrapped/escaped; normalize and try again
+            creds_info = json.loads(gdrive_blob.strip().strip('"').replace('\\"', '"'))
+    elif gdrive_secrets:
+        creds_info = dict(gdrive_secrets)
+
+    if creds_info:
+        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         service = build("drive", "v3", credentials=creds)
     else:
-        service = None
+        service = None  # no Drive available
 except Exception:
     service = None  # no Drive available
 
@@ -41,24 +66,24 @@ REMINDERS_FOLDER_NAME = "AI_CEO_Reminders" # optional; parsed if Drive is config
 def list_folder_contents(parent_id):
     results = service.files().list(
         q=f"'{parent_id}' in parents and trashed = false",
-        fields='files(id, name, mimeType)',
+        fields="files(id, name, mimeType)",
         supportsAllDrives=True,
-        includeItemsFromAllDrives=True
+        includeItemsFromAllDrives=True,
     ).execute()
-    return results.get('files', [])
+    return results.get("files", [])
 
 def get_folder_id_by_exact_name(folder_name):
     results = service.files().list(
         q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed = false",
-        spaces='drive',
-        fields='files(id, name)',
+        spaces="drive",
+        fields="files(id, name)",
         supportsAllDrives=True,
-        includeItemsFromAllDrives=True
+        includeItemsFromAllDrives=True,
     ).execute()
-    folders = results.get('files', [])
+    folders = results.get("files", [])
     if not folders:
         raise Exception(f"Folder '{folder_name}' not found in Drive.")
-    return folders[0]['id']
+    return folders[0]["id"]
 
 def download_file(file_id):
     request = service.files().get_media(fileId=file_id)
@@ -79,8 +104,9 @@ def extract_text_from_pdf(fh: io.BytesIO) -> str:
     pages = [p.get_text("text") or "" for p in doc]
     text = "\n".join(pages)
     if len(text.strip()) < 200:
+        # Fallback extractor in case PyMuPDF returns little/no text
         reader = PdfReader(io.BytesIO(data))
-        text = "\n".join([page.extract_text() or "" for page in reader.pages])
+        text = "\n".join([(page.extract_text() or "") for page in reader.pages])
     return text
 
 def extract_text_from_docx(fh: io.BytesIO) -> str:
@@ -95,7 +121,7 @@ def extract_text_from_excel(fh: io.BytesIO) -> str:
 # Save parsed TXT with headers
 # ─────────────────────────────────────────────────────────────
 def write_parsed_output(folder_label: str, name: str, text: str):
-    base_name = os.path.splitext(name)[0].replace(' ', '_')
+    base_name = os.path.splitext(name)[0].replace(" ", "_")
     output_path = OUTPUT_DIR / f"{base_name}.txt"
     output_path.write_text(f"[FOLDER]: {folder_label}\n[FILE]: {name}\n\n{text}", encoding="utf-8")
     print(f"✅ Saved to {output_path}")
@@ -104,25 +130,25 @@ def write_parsed_output(folder_label: str, name: str, text: str):
         with open(LOWTEXT_LOG, "a", newline="", encoding="utf-8") as lf:
             w = csv.writer(lf)
             if not hdr_exists:
-                w.writerow(["folder","file","chars"])
+                w.writerow(["folder", "file", "chars"])
             w.writerow([folder_label, name, len(text.strip())])
 
 # ─────────────────────────────────────────────────────────────
 # Process Drive file (if Drive is configured)
 # ─────────────────────────────────────────────────────────────
 def process_and_save_drive(file, folder_label):
-    file_id = file['id']
-    name = file['name']
-    mime = file['mimeType']
+    file_id = file["id"]
+    name = file["name"]
+    mime = file["mimeType"]
     print(f"📄 Processing: {name}")
     try:
-        if mime == 'application/pdf':
+        if mime == "application/pdf":
             fh = download_file(file_id)
             text = extract_text_from_pdf(fh)
-        elif mime == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+        elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             fh = download_file(file_id)
             text = extract_text_from_docx(fh)
-        elif mime == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+        elif mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
             fh = download_file(file_id)
             text = extract_text_from_excel(fh)
         else:
@@ -149,11 +175,11 @@ def parse_local_reminders():
 def parse_knowledgebase_drive():
     parent_id = get_folder_id_by_exact_name(KB_FOLDER_NAME)
     for folder in list_folder_contents(parent_id):
-        if folder['mimeType'] != 'application/vnd.google-apps.folder':
+        if folder["mimeType"] != "application/vnd.google-apps.folder":
             continue
-        label = folder['name']
+        label = folder["name"]
         print(f"\n📁 Scanning KB subfolder: {label}")
-        for file in list_folder_contents(folder['id']):
+        for file in list_folder_contents(folder["id"]):
             process_and_save_drive(file, label)
 
 def parse_reminders_drive():
@@ -187,6 +213,6 @@ def main():
 
     print("✅ Parsing complete.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
